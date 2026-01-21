@@ -49,7 +49,10 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
@@ -674,7 +677,14 @@ class DecodePreallocQueue:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+            alloc_extend_func = (
+                self.token_to_kv_pool_allocator.alloc_extend_for_pre_alloc_b1
+                if isinstance(
+                    self.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator
+                )
+                else self.token_to_kv_pool_allocator.alloc_extend
+            )
+            kv_loc = alloc_extend_func(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),

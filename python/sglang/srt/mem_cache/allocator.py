@@ -388,6 +388,43 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
+    def alloc_extend_for_pre_alloc_b1(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        assert prefix_lens_cpu.numel() == 1
+        assert prefix_lens_cpu[0] == 0
+        assert seq_lens_cpu[0] == extend_num_tokens
+
+        bs = len(prefix_lens)
+        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
+            self.free_pages
+        ):
+            self.merge_and_sort_free()
+        seq_len = seq_lens_cpu[0]
+        num_new_pages = (seq_len + self.page_size - 1) // self.page_size
+        if num_new_pages > len(self.free_pages):
+            return None
+
+        used_pages = self.free_pages[:num_new_pages]
+        page_offs = (used_pages * self.page_size).reshape([-1, 1])
+        out_indices = (
+            torch.arange(0, self.page_size, dtype=torch.int64, device=self.device)
+            + page_offs
+        )
+        out_indices = out_indices.reshape(-1)[:extend_num_tokens]
+
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
+
+        self.free_pages = self.free_pages[num_new_pages:]
+        return out_indices
+
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
