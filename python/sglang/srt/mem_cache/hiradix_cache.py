@@ -211,6 +211,20 @@ class HiRadixCache(RadixCache):
             self.page_size / 1024 * prefetch_timeout_per_ki_token
         )
 
+        storage_metrics_collector = None
+        if enable_storage_metrics:
+            labels = {
+                "storage_backend": storage_backend,
+                "tp_rank": self.cache_controller.tp_rank,
+                "dp_rank": self.cache_controller.dp_rank,
+                "pp_rank": self.cache_controller.pp_rank,
+                "pp_size": self.cache_controller.pp_size,
+            }
+            if extra_metric_labels:
+                labels.update(extra_metric_labels)
+            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+            storage_metrics_collector = StorageMetricsCollector(labels=labels)
+
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
