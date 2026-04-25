@@ -23,6 +23,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
+    PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
@@ -293,13 +294,31 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        swa_xfer = None
+        if extra_pools:
+            for pool in extra_pools:
+                if (
+                    pool.name == PoolName.SWA
+                    and pool.device_indices is None
+                    and pool.host_indices is not None
+                ):
+                    swa_xfer = pool
+                    break
+
         need_load_kv = host_indices.numel() > 0
-        if need_load_kv:
+        if not need_load_kv:
+            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        elif swa_xfer is not None:
+            result = self.mem_pool_device_allocator.alloc_full_with_suffix_swa(
+                len(host_indices), swa_xfer.swa_suffix_tokens
+            )
+            if result is None:
+                return None
+            device_indices, swa_xfer.device_indices = result
+        else:
             device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
-        else:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
 
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
@@ -472,6 +491,7 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices=transfer_device_indices,
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
+                        swa_suffix_tokens=transfer.swa_suffix_tokens,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers

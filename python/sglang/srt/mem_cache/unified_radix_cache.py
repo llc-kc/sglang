@@ -781,6 +781,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
             if node.evicted:
                 self._unevict_node_on_insert(node, value[:prefix_len])
+                # FULL was restored from the request's fresh KV. Aux
+                # components (e.g. SWA) may still hold tombstones and need
+                # to rebuild their value from the same slice.
+                for component in self._components_tuple:
+                    if component.component_type == BASE_COMPONENT_TYPE:
+                        continue
+                    component.recover_after_unevict(
+                        node=node,
+                        prefix_len=prefix_len,
+                        total_prefix_len=total_prefix_length,
+                        params=params,
+                    )
             else:
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len
@@ -1520,6 +1532,7 @@ class UnifiedRadixCache(BasePrefixCache):
         TODO(hzh): This method has relatively high latency; simplify the
         check logic once the tree implementation stabilizes.
         """
+
         errors: list[str] = []
         E = errors.append
         all_nodes = self._collect_all_nodes()

@@ -34,6 +34,7 @@ class ComponentType(int, Enum):
     FULL = 0
     SWA = 1
     MAMBA = 2
+    SHARED_ANCHOR = 3
 
     def __str__(self) -> str:  # keep human-readable logging
         return self.name.lower()
@@ -49,6 +50,10 @@ class ComponentType(int, Enum):
     @property
     def is_mamba(self) -> bool:
         return self == ComponentType.MAMBA
+
+    @property
+    def is_shared_anchor(self) -> bool:
+        return self == ComponentType.SHARED_ANCHOR
 
 
 BASE_COMPONENT_TYPE = ComponentType.FULL
@@ -162,6 +167,19 @@ class TreeComponent(ABC):
         """Return True to veto leaf creation when the entire new leaf would
         be a tombstone for this component."""
         return False
+
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> None:
+        """Called after _unevict_node_on_insert restores the base (Full) value
+        on an evicted node. Aux components (e.g. SWA) override this to rebuild
+        their own data from the freshly assigned base value when their entry
+        is still tombstoned. Default no-op."""
+        return None
 
     def commit_insert_component_data(
         self,

@@ -45,9 +45,11 @@ class SWAKVPool(KVCache):
         self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
+        self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = 0
         self.page_size = page_size
         self.swa_loc = None
+        self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
         kwargs["enable_memory_saver"] = False
@@ -94,6 +96,15 @@ class SWAKVPool(KVCache):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
+        self.full_kv_pool.register_layer_transfer_counter(None)
+        self.swa_kv_pool.register_layer_transfer_counter(None)
+
+    def _wait_for_layer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
     def get_kv_size_bytes(self):
         k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
         k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
@@ -117,6 +128,7 @@ class SWAKVPool(KVCache):
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_key_buffer(layer_id_pool)
@@ -124,6 +136,7 @@ class SWAKVPool(KVCache):
             return self.full_kv_pool.get_key_buffer(layer_id_pool)
 
     def get_value_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_value_buffer(layer_id_pool)
@@ -131,6 +144,7 @@ class SWAKVPool(KVCache):
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
 
     def get_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
@@ -355,6 +369,52 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
+    def alloc_full_with_suffix_swa(
+        self,
+        n_full: int,
+        n_swa_suffix: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """HiCache load-back alloc: full slot for every token, SWA slot only
+        for the trailing ``n_swa_suffix`` tokens.
+
+        Returns (full_indices, swa_indices) on success, None on OOM.
+        Mapping invariant after this call:
+          full_to_swa_index_mapping[full_indices[:-n_swa_suffix]] == 0  (VOID)
+          full_to_swa_index_mapping[full_indices[-n_swa_suffix:]] == swa_indices
+        """
+        assert 0 <= n_swa_suffix <= n_full
+        if n_full > self.full_attn_allocator.available_size():
+            return None
+        if n_swa_suffix > self.swa_attn_allocator.available_size():
+            return None
+
+        full_indices = self.full_attn_allocator.alloc(n_full)
+        if full_indices is None:
+            return None
+
+        if n_swa_suffix == 0:
+            return full_indices, torch.empty(
+                (0,), dtype=torch.int64, device=self.device
+            )
+
+        swa_indices = self.swa_attn_allocator.alloc(n_swa_suffix)
+        if swa_indices is None:
+            self.full_attn_allocator.free(full_indices)
+            return None
+
+        # Prefix slots have no SWA pair. Write 0 into the mapping for them.
+        # free_swa filters out the 0 entries to skip them on free.
+        if _is_npu:
+            full_idx64 = full_indices.to(torch.int64)
+            self.full_to_swa_index_mapping[full_idx64[:-n_swa_suffix]] = 0
+            self.full_to_swa_index_mapping[full_idx64[-n_swa_suffix:]] = swa_indices.to(
+                torch.int64
+            )
+        else:
+            self.full_to_swa_index_mapping[full_indices[:-n_swa_suffix]] = 0
+            self.full_to_swa_index_mapping[full_indices[-n_swa_suffix:]] = swa_indices
+        return full_indices, swa_indices
+        
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,

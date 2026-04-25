@@ -1,14 +1,17 @@
+from __future__ import annotations
+
 import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,7 @@ class PoolName(str, Enum):
 
     KV = "kv"
     MAMBA = "mamba"
+    SWA = "swa"
     INDEXER = "indexer"
 
     def __str__(self) -> str:
@@ -73,7 +77,8 @@ class PoolTransfer:
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
-
+    # SWA LOAD_BACK only: trailing-token count needing an SWA device slot.
+    swa_suffix_tokens: int = 0
 
 @dataclass
 class PoolTransferResult:
