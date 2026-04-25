@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.metrics.collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams

@@ -433,6 +433,13 @@ class SchedulerRuntimeCheckerMixin:
         ):
             return
 
+        # Flush pending write-through acks so that nodes whose DMA has
+        # completed are unlocked before the memory-leak check runs.
+        # Use blocking flush (write_back=True) since we are idle anyway;
+        # a non-blocking poll may miss in-flight DMAs that haven't finished yet.
+        if self.enable_hierarchical_cache:
+            self.tree_cache.writing_check(write_back=True)
+            self.tree_cache.loading_check(blocking=True)
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio

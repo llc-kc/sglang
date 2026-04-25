@@ -352,6 +352,8 @@ class SWARadixCache(BasePrefixCache):
 
         if params.enable_metrics:
             self.init_metrics_collector()
+        else:
+            self.metrics_collector = None
 
         self.sliding_window_size = params.sliding_window_size
         self.reset()

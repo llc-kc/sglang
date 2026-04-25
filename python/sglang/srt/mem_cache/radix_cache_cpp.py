@@ -61,6 +61,8 @@ class RadixCacheCpp(BasePrefixCache):
 
         if params.enable_metrics:
             self.init_metrics_collector()
+        else:
+            self.metrics_collector = None
 
         if not server_args.enable_hierarchical_cache:
             self.tree = RadixTreeCpp(

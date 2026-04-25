@@ -394,6 +394,8 @@ class MambaRadixCache(BasePrefixCache):
 
         if params.enable_metrics:
             self.init_metrics_collector()
+        else:
+            self.metrics_collector = None
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
