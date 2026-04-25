@@ -677,6 +677,8 @@ class Scheduler(
                     tree_components.append(
                         ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
                     )
+                if self.tp_worker.model_runner.model_config.is_swa_with_compressed_attention:
+                    tree_components.append(ComponentType.DSV4_COMPRESSED)
                 params.tree_components = tuple(tree_components)
                 self.tree_cache = UnifiedRadixCache(params)
                 if self.enable_hierarchical_cache:

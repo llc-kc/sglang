@@ -70,6 +70,9 @@ class CacheOperation(BaseCacheOperation):
                 host_indices=cat_or_none(t.host_indices for t in ts),
                 device_indices=cat_or_none(t.device_indices for t in ts),
                 keys=[k for t in ts if t.keys for k in t.keys] or None,
+                hit_policy=ts[0].hit_policy,
+                swa_suffix_tokens=sum(t.swa_suffix_tokens for t in ts),
+                device_indices_source=ts[0].device_indices_source,
             )
             for name, ts in grouped.items()
         ]
@@ -309,6 +312,12 @@ class HybridCacheController(BaseHiCacheController):
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         elif swa_xfer is not None:
+            if len(swa_xfer.host_indices) != swa_xfer.swa_suffix_tokens:
+                raise ValueError(
+                    "SWA loadback host indices must match swa_suffix_tokens, "
+                    f"got len(host_indices)={len(swa_xfer.host_indices)} and "
+                    f"swa_suffix_tokens={swa_xfer.swa_suffix_tokens}"
+                )
             result = self.mem_pool_device_allocator.alloc_full_with_suffix_swa(
                 len(host_indices), swa_xfer.swa_suffix_tokens
             )
@@ -492,6 +501,7 @@ class HybridCacheController(BaseHiCacheController):
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
                         swa_suffix_tokens=transfer.swa_suffix_tokens,
+                        device_indices_source=transfer.device_indices_source,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
@@ -519,7 +529,7 @@ class HybridCacheController(BaseHiCacheController):
     def _resolve_shared_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:
             entry = self.mem_pool_host.entry_map.get(transfer.name)
-            if entry.share_indices_with_anchor:
+            if entry is not None and entry.share_indices_with_anchor:
                 transfer.keys = operation.hash_value
                 transfer.host_indices = operation.host_indices
 
@@ -554,16 +564,47 @@ class HybridCacheController(BaseHiCacheController):
         if not extra_pools:
             return None
         newly_allocated: list[tuple[PoolTransfer, Any, torch.Tensor]] = []
+        resolved_by_name: dict[PoolName, PoolTransfer] = {}
+
+        def rollback() -> None:
+            for prev_pool, prev_entry_pool, prev_indices in newly_allocated:
+                prev_entry_pool.free(prev_indices)
+                if alloc_host:
+                    prev_pool.host_indices = None
+                else:
+                    prev_pool.device_indices = None
+
+        def mark_resolved(pool: PoolTransfer) -> None:
+            if pool.host_indices is not None and pool.device_indices is not None:
+                resolved_by_name[pool.name] = pool
+
+        deferred_source_pools: list[PoolTransfer] = []
         for pool in extra_pools:
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
+                rollback()
+                return None
+            if pool.device_indices_source is not None:
+                deferred_source_pools.append(pool)
                 continue
             if entry.share_indices_with_anchor:
                 pool.device_indices = kv_device_indices
                 pool.host_indices = kv_host_indices
+                mark_resolved(pool)
+                continue
+            if entry.derive_indices_fn is not None:
+                if kv_host_indices is None or kv_device_indices is None:
+                    rollback()
+                    return None
+                if pool.host_indices is None:
+                    pool.host_indices = entry.derive_indices_fn(kv_host_indices)
+                if pool.device_indices is None:
+                    pool.device_indices = entry.derive_indices_fn(kv_device_indices)
+                mark_resolved(pool)
                 continue
             if alloc_host:
                 if pool.host_indices is not None or pool.device_indices is None:
+                    mark_resolved(pool)
                     continue
                 entry_pool, evict_fn, size = (
                     entry.host_pool,
@@ -572,6 +613,7 @@ class HybridCacheController(BaseHiCacheController):
                 )
             else:
                 if pool.device_indices is not None or pool.host_indices is None:
+                    mark_resolved(pool)
                     continue
                 entry_pool, evict_fn, size = (
                     entry.device_pool,
@@ -583,17 +625,28 @@ class HybridCacheController(BaseHiCacheController):
                 evict_fn(size)
                 indices = entry_pool.alloc(size)
             if indices is None:
-                # Roll back all previous allocations using each pool's own entry_pool.
-                for prev_pool, prev_entry_pool, prev_indices in newly_allocated:
-                    prev_entry_pool.free(prev_indices)
-                    if alloc_host:
-                        prev_pool.host_indices = None
-                    else:
-                        prev_pool.device_indices = None
+                rollback()
                 return None
             if alloc_host:
                 pool.host_indices = indices
             else:
                 pool.device_indices = indices
             newly_allocated.append((pool, entry_pool, indices))
+            mark_resolved(pool)
+
+        for pool in deferred_source_pools:
+            source_name = pool.device_indices_source
+            if source_name == PoolName.KV:
+                source_host_indices = kv_host_indices
+                source_device_indices = kv_device_indices
+            else:
+                source = resolved_by_name.get(source_name)
+                source_host_indices = None if source is None else source.host_indices
+                source_device_indices = None if source is None else source.device_indices
+            if source_host_indices is None or source_device_indices is None:
+                rollback()
+                return None
+            pool.host_indices = source_host_indices
+            pool.device_indices = source_device_indices
+            mark_resolved(pool)
         return extra_pools
