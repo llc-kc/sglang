@@ -1761,7 +1761,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         device_buffers: list[torch.Tensor],
         item_bytes: int,
         num_host_pages: int,
-        slot_page_size: Optional[int] = None,
+        slot_page_size: int,
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
@@ -1776,7 +1776,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.device = device
         self.pin_memory = pin_memory
         self.allocator = get_allocator_from_storage(allocator_type)
-        self.page_size = slot_page_size or 1
+        self.page_size = slot_page_size
         self.size = num_host_pages * self.page_size
         self.layout = "layer_first"
         self.size_per_token = item_bytes
@@ -1815,9 +1815,9 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.clear()
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        if self.slot_page_size is None:
-            return indices
-        return torch.unique(indices.to(torch.int64) // self.slot_page_size)
+        return (
+            indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+        )
 
     def get_size_per_token(self):
         return self.item_bytes
@@ -1839,12 +1839,11 @@ class DeepSeekV4PagedHostPool(HostKVCache):
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > self.available_size():
             return None
-        if self.slot_page_size is not None:
-            need_size = (
-                (need_size + self.slot_page_size - 1) // self.slot_page_size
-            ) * self.slot_page_size
-            if need_size > self.available_size():
-                return None
+        need_size = (
+            (need_size + self.slot_page_size - 1) // self.slot_page_size
+        ) * self.slot_page_size
+        if need_size > self.available_size():
+            return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -1883,6 +1882,9 @@ class DeepSeekV4PagedHostPool(HostKVCache):
             return
         host_indices = self._to_page_indices(host_indices)
         device_indices = self._to_page_indices(device_indices)
+        
+        if layer_id == 0:
+            logger.info("Pool %s transferring %d pages from layer %d to device.", self.pool_name, len(host_indices), layer_id)
         transfer_kv_direct(
             src_layers=[self.kv_buffer[layer_id]],
             dst_layers=[self.device_buffers[layer_id]],
@@ -1893,8 +1895,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
 
     def get_data_page(self, index, flat=True):
         # kv_buffer is per-layer [num_host_pages, item_bytes]; index is page index
-        if self.slot_page_size is not None:
-            index = int(index) // self.slot_page_size
+        index = int(index) // self.slot_page_size
         data_page = torch.stack(
             [self.kv_buffer[i][index] for i in range(self.layer_num)]
         )
@@ -1911,8 +1912,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index, data_page):
-        if self.slot_page_size is not None:
-            index = int(index) // self.slot_page_size
+        index = int(index) // self.slot_page_size
         data = data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
         for i in range(self.layer_num):
             self.kv_buffer[i][index].copy_(data[i])
@@ -1989,6 +1989,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
             for _ in range(self.layer_num)
         ]
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        logger.info(
+            "Allocating %.2f GB host memory for V4 state pool '%s' "
+            "(layers=%d, pages=%d, state_page_bytes=%d).",
+            self.layer_num * num_host_pages * self.state_page_bytes / 1e9,
+            self.pool_name,
+            self.layer_num,
+            num_host_pages,
+            self.state_page_bytes,
+        )
         self.clear()
 
     def _init_device_page_views(self) -> None:
@@ -2028,7 +2037,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.state_page_bytes = expected_state_page_bytes
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        return torch.unique(indices.to(torch.int64) // self.swa_page_size)
+        return (
+            indices.reshape(-1, self.swa_page_size)[:, 0] // self.swa_page_size
+        )
 
     def get_size_per_token(self):
         return self.state_page_bytes
@@ -2145,9 +2156,7 @@ class PoolEntry:
     # device_evict_fn(n): evict n slots from the device pool (used by load()).
     host_evict_fn: Optional[Callable] = None
     device_evict_fn: Optional[Callable] = None
-    # Optional callback to derive compressed indices from full indices.
-    # Used by V4 compressed pools: given full indices, returns page-level indices.
-    derive_indices_fn: Optional[Callable] = None
+    derive_indices_from_pool: Optional[PoolName] = None
 
 
 class HostPoolGroup:

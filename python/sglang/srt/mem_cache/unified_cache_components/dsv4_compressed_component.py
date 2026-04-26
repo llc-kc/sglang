@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable, Optional
 
-import torch
-
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -66,31 +64,12 @@ class DeepSeekV4CompressedComponent(TreeComponent):
         ]
 
     def _available_state_transfers(self) -> list[PoolTransfer]:
+        """State transfers derived from SWA pool (via PoolEntry.derive_indices_from_pool)."""
         return [
-            PoolTransfer(name=name, device_indices_source=PoolName.SWA)
+            PoolTransfer(name=name)
             for name in self._SWA_DERIVED_STATE_POOLS
             if self._has_pool(name)
         ]
-
-    def _collect_swa_host_suffix(
-        self, node: UnifiedTreeNode
-    ) -> Optional[torch.Tensor]:
-        collected_leaf_first: list[torch.Tensor] = []
-        n_swa = 0
-        cur = node
-        while cur is not None and cur.evicted:
-            cd = cur.component_data[ComponentType.SWA]
-            if cd.host_value is None:
-                break
-            collected_leaf_first.append(cd.host_value)
-            n_swa += len(cd.host_value)
-            if n_swa >= self.sliding_window_size:
-                break
-            cur = cur.parent
-        if not collected_leaf_first:
-            return None
-        collected_leaf_first.reverse()
-        return torch.cat(collected_leaf_first)
 
     def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
         return lambda node: True
@@ -133,11 +112,8 @@ class DeepSeekV4CompressedComponent(TreeComponent):
             return transfers or None
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            swa_host_indices = self._collect_swa_host_suffix(node)
-            if swa_host_indices is not None:
-                for transfer in self._available_state_transfers():
-                    transfer.host_indices = swa_host_indices
-                    transfers.append(transfer)
+            if node.component_data[ComponentType.SWA].host_value is not None:
+                transfers.extend(self._available_state_transfers())
             return transfers or None
 
         return None

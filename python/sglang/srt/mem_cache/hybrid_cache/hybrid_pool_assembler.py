@@ -77,7 +77,7 @@ def build_pool_entry(
     share_indices_with_anchor: bool = False,
     host_evict_fn: Optional[Callable[[int], Any]] = None,
     device_evict_fn: Optional[Callable[[int], Any]] = None,
-    derive_indices_fn: Optional[Callable[[Any], Any]] = None,
+    derive_indices_from_pool: Optional[PoolName] = None,
 ) -> PoolEntry:
     return PoolEntry(
         name=name,
@@ -88,7 +88,7 @@ def build_pool_entry(
         share_indices_with_anchor=share_indices_with_anchor,
         host_evict_fn=host_evict_fn,
         device_evict_fn=device_evict_fn,
-        derive_indices_fn=derive_indices_fn,
+        derive_indices_from_pool=derive_indices_from_pool,
     )
 
 
@@ -235,23 +235,10 @@ def build_hybrid_swa_stack(
     )
     return host_pool_group, cache_controller
 
-
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
 def _v4_paged_item_bytes(device_buffers: list[torch.Tensor]) -> int:
     if not device_buffers:
         return 0
     return device_buffers[0].shape[1] * device_buffers[0].element_size()
-
-
-def _v4_state_page_bytes(state_pools: list) -> int:
-    if not state_pools:
-        return 0
-    pool = state_pools[0]
-    return pool.ring_size * pool.kv_score_buffer.kv_score[0].nbytes
-
 
 def _v4_num_host_pages(
     *,
@@ -259,41 +246,24 @@ def _v4_num_host_pages(
     server_args: ServerArgs,
     kvcache: Any,
     page_size: int,
-    c4_state_pools: list,
-    c4_indexer_state_pools: list,
-    c128_state_pools: list,
-) -> int:
+    swa_page_size: int
+) -> tuple[int, int]:
+    """Return (num_host_pages, swa_num_host_pages).
+ 
+    * num_host_pages     – for logical / C4 / C4-indexer / C128 host pools
+    * swa_num_host_pages – for SWA / state host pools
+    """
     allocator = params.token_to_kv_pool_allocator
     device_full_size = getattr(allocator, "size_full", kvcache.size)
-    device_full_pages = _ceil_div(device_full_size, page_size)
+    device_full_pages = (device_full_size + page_size - 1) // page_size
 
-    if server_args.hicache_size <= 0:
-        return max(
-            int(device_full_pages * server_args.hicache_ratio),
-            device_full_pages + 1,
-        )
+    device_swa_size = kvcache.swa_size
+    device_swa_pages = (device_swa_size + swa_page_size - 1) // swa_page_size
 
-    bytes_per_page = 0
-    bytes_per_page += kvcache.swa_kv_pool.layer_num * _v4_paged_item_bytes(
-        kvcache.swa_kv_pool.kv_buffer
-    )
-    bytes_per_page += kvcache.c4_kv_pool.layer_num * _v4_paged_item_bytes(
-        kvcache.c4_kv_pool.kv_buffer
-    )
-    bytes_per_page += kvcache.c4_indexer_kv_pool.layer_num * _v4_paged_item_bytes(
-        kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer
-    )
-    bytes_per_page += kvcache.c128_kv_pool.layer_num * _v4_paged_item_bytes(
-        kvcache.c128_kv_pool.kv_buffer
-    )
-    bytes_per_page += len(c4_state_pools) * _v4_state_page_bytes(c4_state_pools)
-    bytes_per_page += len(c4_indexer_state_pools) * _v4_state_page_bytes(
-        c4_indexer_state_pools
-    )
-    bytes_per_page += len(c128_state_pools) * _v4_state_page_bytes(c128_state_pools)
-    if bytes_per_page == 0:
-        return max(device_full_pages + 1, 1)
-    return max(int(server_args.hicache_size * 1e9 // bytes_per_page), 1)
+    ratio = server_args.hicache_ratio
+    full_host = max(int(device_full_pages * ratio), device_full_pages + 1)
+    swa_host = max(int(device_swa_pages * ratio), device_swa_pages + 1)
+    return full_host, swa_host
 
 
 def build_deepseek_v4_hicache_stack(
@@ -351,25 +321,20 @@ def build_deepseek_v4_hicache_stack(
     c128_state_pools = [
         kvcache.compress_state_pools[layer_id] for layer_id in c128_state_global_layers
     ]
-    num_host_pages = _v4_num_host_pages(
+    num_host_pages, swa_num_host_pages = _v4_num_host_pages(
         params=params,
         server_args=server_args,
         kvcache=kvcache,
         page_size=page_size,
-        c4_state_pools=c4_state_pools,
-        c4_indexer_state_pools=c4_indexer_state_pools,
-        c128_state_pools=c128_state_pools,
+        swa_page_size=kvcache.swa_page_size,
     )
-
-    def derive_full_page_indices(indices: torch.Tensor) -> torch.Tensor:
-        return torch.unique(indices.to(torch.int64) // page_size)
 
     logical_host_pool = LogicalHostPool(num_host_pages * page_size, page_size)
     swa_host_pool = DeepSeekV4PagedHostPool(
         pool_name=str(PoolName.SWA),
         device_buffers=kvcache.swa_kv_pool.kv_buffer,
         item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
-        num_host_pages=num_host_pages,
+        num_host_pages=swa_num_host_pages,
         slot_page_size=kvcache.swa_page_size,
         allocator_type=server_args.hicache_storage_backend,
     )
@@ -399,6 +364,7 @@ def build_deepseek_v4_hicache_stack(
             device_buffers=kvcache.c4_kv_pool.kv_buffer,
             item_bytes=kvcache.c4_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
+            slot_page_size=page_size,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
@@ -408,19 +374,20 @@ def build_deepseek_v4_hicache_stack(
                 kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer
             ),
             num_host_pages=num_host_pages,
+            slot_page_size=page_size,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
             state_pools=c4_state_pools,
-            num_host_pages=num_host_pages,
+            num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_INDEXER_STATE),
             state_pools=c4_indexer_state_pools,
-            num_host_pages=num_host_pages,
+            num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
             allocator_type=server_args.hicache_storage_backend,
         )
@@ -432,7 +399,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=kvcache.c4_kv_pool,
                     layer_mapping=c4_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
-                    derive_indices_fn=derive_full_page_indices,
+                    derive_indices_from_pool=PoolName.KV,
                 ),
                 build_pool_entry(
                     name=PoolName.DEEPSEEK_V4_C4_INDEXER,
@@ -440,7 +407,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=kvcache.c4_indexer_kv_pool,
                     layer_mapping=c4_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
-                    derive_indices_fn=derive_full_page_indices,
+                    derive_indices_from_pool=PoolName.KV,
                 ),
                 build_pool_entry(
                     name=PoolName.DEEPSEEK_V4_C4_STATE,
@@ -448,6 +415,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=None,
                     layer_mapping=c4_state_mapping,
                     transfer_layer_num=transfer_layer_num,
+                    derive_indices_from_pool=PoolName.SWA,
                 ),
                 build_pool_entry(
                     name=PoolName.DEEPSEEK_V4_INDEXER_STATE,
@@ -455,6 +423,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=None,
                     layer_mapping=c4_state_mapping,
                     transfer_layer_num=transfer_layer_num,
+                    derive_indices_from_pool=PoolName.SWA,
                 ),
             ]
         )
@@ -465,12 +434,13 @@ def build_deepseek_v4_hicache_stack(
             device_buffers=kvcache.c128_kv_pool.kv_buffer,
             item_bytes=kvcache.c128_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
+            slot_page_size=page_size,
             allocator_type=server_args.hicache_storage_backend,
         )
         c128_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
             state_pools=c128_state_pools,
-            num_host_pages=num_host_pages,
+            num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
             allocator_type=server_args.hicache_storage_backend,
         )
@@ -482,7 +452,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=kvcache.c128_kv_pool,
                     layer_mapping=c128_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
-                    derive_indices_fn=derive_full_page_indices,
+                    derive_indices_from_pool=PoolName.KV,
                 ),
                 build_pool_entry(
                     name=PoolName.DEEPSEEK_V4_C128_STATE,
@@ -490,6 +460,7 @@ def build_deepseek_v4_hicache_stack(
                     device_pool=None,
                     layer_mapping=c128_state_mapping,
                     transfer_layer_num=transfer_layer_num,
+                    derive_indices_from_pool=PoolName.SWA,
                 ),
             ]
         )
