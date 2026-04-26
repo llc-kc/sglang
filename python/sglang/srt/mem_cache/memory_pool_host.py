@@ -1859,19 +1859,12 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         )
         return len(indices)
 
-    def _check_io_backend(self, io_backend: str) -> None:
-        if io_backend != "direct":
-            raise NotImplementedError(
-                f"{self.pool_name} supports only direct io_backend, got {io_backend}"
-            )
-
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
         """D->H: page-level transfer, all layers."""
         if host_indices is None or device_indices is None:
             return
-        self._check_io_backend(io_backend)
         host_indices = self._to_page_indices(host_indices)
         device_indices = self._to_page_indices(device_indices)
         transfer_kv_direct(
@@ -1888,7 +1881,6 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         """H->D: page-level transfer, one layer."""
         if host_indices is None or device_indices is None:
             return
-        self._check_io_backend(io_backend)
         host_indices = self._to_page_indices(host_indices)
         device_indices = self._to_page_indices(device_indices)
         transfer_kv_direct(
@@ -2038,12 +2030,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return torch.unique(indices.to(torch.int64) // self.swa_page_size)
 
-    def _check_io_backend(self, io_backend: str) -> None:
-        if io_backend != "direct":
-            raise NotImplementedError(
-                f"{self.pool_name} supports only direct io_backend, got {io_backend}"
-            )
-
     def get_size_per_token(self):
         return self.state_page_bytes
 
@@ -2081,7 +2067,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
     ):
         if host_indices is None or device_indices is None:
             return
-        self._check_io_backend(io_backend)
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         transfer_kv_direct(
@@ -2097,7 +2082,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
     ):
         if host_indices is None or device_indices is None:
             return
-        self._check_io_backend(io_backend)
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         transfer_kv_direct(
@@ -2270,6 +2254,17 @@ class HostPoolGroup:
             local_layer_id = entry.layer_mapper(layer_id)
             if local_layer_id is None:
                 continue
+            if local_layer_id == 0:
+                logger.info(
+                    "HiCache load pool=%s layer=%d local=%d "
+                    "host_indices=%s device_indices=%s, len:%d",
+                    transfer.name,
+                    layer_id,
+                    local_layer_id,
+                    transfer.host_indices.shape,
+                    transfer.device_indices.shape,
+                    transfer.host_indices.numel(),
+                )
             entry.host_pool.load_to_device_per_layer(
                 entry.device_pool,
                 transfer.host_indices,

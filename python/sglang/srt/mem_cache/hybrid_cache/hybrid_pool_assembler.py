@@ -318,7 +318,10 @@ def build_deepseek_v4_hicache_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(kvcache.compression_ratios)
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
-    swa_layer_mapping = dict(full_layer_mapping)
+    swa_device_layers = len(kvcache.swa_kv_pool.kv_buffer)
+    swa_layer_mapping = {
+        layer_id: layer_id for layer_id in range(swa_device_layers)
+    }
 
     c4_layer_mapping = {}
     c128_layer_mapping = {}

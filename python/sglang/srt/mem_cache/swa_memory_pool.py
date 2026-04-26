@@ -14,9 +14,12 @@ from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
+
+_is_npu = is_npu()
 
 
 class SWAKVPool(KVCache):
