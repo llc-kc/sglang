@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import logging
 import threading
 import time
@@ -450,7 +451,7 @@ class HiCacheController:
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
-        
+
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
@@ -613,7 +614,21 @@ class HiCacheController:
             self.dp_rank = 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
-        is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        # DeepSeek-V4's logical anchor pool is also MLA-style for storage: one
+        # page object per hash, while its compressed sidecar pools are handled
+        # through the v2 pool transfer API.
+        try:
+            from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                DeepSeekV4TokenToKVPool,
+            )
+        except ImportError:
+            DeepSeekV4TokenToKVPool = None
+        mla_backend_types = (
+            (MLATokenToKVPool, DeepSeekV4TokenToKVPool)
+            if DeepSeekV4TokenToKVPool is not None
+            else (MLATokenToKVPool,)
+        )
+        is_mla_backend = isinstance(self.mem_pool_device, mla_backend_types)
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False

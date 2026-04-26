@@ -453,6 +453,10 @@ class HybridCacheController(BaseHiCacheController):
             )
             hash_value.append(last_hash)
 
+        operation.hash_value = hash_value
+        if operation.pool_transfers:
+            self._prepare_storage_pool_transfers(operation)
+
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
@@ -470,6 +474,11 @@ class HybridCacheController(BaseHiCacheController):
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         if kv_hit_pages > 0 and operation.pool_transfers:
+            self._sync_all_page_keys(
+                operation.pool_transfers,
+                hash_value,
+                kv_hit_pages,
+            )
             self._sync_trailing_keys(operation.pool_transfers, hash_value, kv_hit_pages)
 
         return (
@@ -507,6 +516,8 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
+        if operation.pool_transfers:
+            self._prepare_storage_pool_transfers(operation)
         # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
             self._resolve_shared_pool_transfers(operation)
@@ -517,6 +528,8 @@ class HybridCacheController(BaseHiCacheController):
         super()._page_transfer(operation)
 
     def _page_backup(self, operation):
+        if operation.pool_transfers:
+            self._prepare_storage_pool_transfers(operation)
         # Backup extra pools
         if operation.pool_transfers:
             self._resolve_shared_pool_transfers(operation)
@@ -532,6 +545,17 @@ class HybridCacheController(BaseHiCacheController):
             if entry is not None and entry.share_indices_with_anchor:
                 transfer.keys = operation.hash_value
                 transfer.host_indices = operation.host_indices
+
+    def _sync_all_page_keys(
+        self,
+        pool_transfers: list[PoolTransfer],
+        all_hashes: list[str],
+        kv_hit_pages: int,
+    ) -> None:
+        for transfer in pool_transfers:
+            if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                continue
+            transfer.keys = all_hashes[:kv_hit_pages]
 
     def _sync_trailing_keys(
         self,
@@ -552,6 +576,32 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
+
+    def _prepare_storage_pool_transfers(self, operation) -> None:
+        """Align v2 pool transfer keys/indices to operation.hash_value.
+
+        Storage prefetch first allocates the largest possible host ranges, then
+        the storage hit query may shrink the KV prefix. Mooncake's v2 API needs
+        one key per host page, so trim each pool to the final hit length here.
+        """
+        if not operation.hash_value:
+            return
+        for transfer in operation.pool_transfers or []:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            page_size = getattr(entry.host_pool, "page_size", 1) or 1
+            max_pages = len(transfer.host_indices) // page_size
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                num_pages = min(
+                    max_pages,
+                    len(transfer.keys) if transfer.keys else len(operation.hash_value),
+                )
+                transfer.keys = operation.hash_value[-num_pages:] if num_pages else []
+            else:
+                num_pages = min(max_pages, len(operation.hash_value))
+                transfer.keys = operation.hash_value[:num_pages]
+            transfer.host_indices = transfer.host_indices[: num_pages * page_size]
 
     def _resolve_pool_transfers_allocation(
         self,
