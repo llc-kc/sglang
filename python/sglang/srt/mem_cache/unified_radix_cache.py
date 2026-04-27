@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from collections import defaultdict
@@ -352,7 +353,10 @@ class UnifiedRadixCache(BasePrefixCache):
         }
         self.ongoing_write_through: dict[int, UnifiedTreeNode] = {}
         self.ongoing_load_back: dict[int, UnifiedTreeNode] = {}
-        self.enable_storage = False
+        self.enable_storage = (
+            self.cache_controller is not None
+            and getattr(self.cache_controller, "enable_storage", False)
+        )
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
 
@@ -390,10 +394,29 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.load_back_threshold = 256
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+        self.hicache_storage_pass_prefix_keys = False
+        if server_args.hicache_storage_backend_extra_config:
+            if server_args.hicache_storage_backend_extra_config.startswith("@"):
+                path = server_args.hicache_storage_backend_extra_config[1:]
+                with open(path, "r") as f:
+                    extra_config = json.load(f)
+            else:
+                extra_config = json.loads(
+                    server_args.hicache_storage_backend_extra_config
+                )
+            self.hicache_storage_pass_prefix_keys = extra_config.get(
+                "hicache_storage_pass_prefix_keys", False
+            )
+            if not isinstance(self.hicache_storage_pass_prefix_keys, bool):
+                raise ValueError(
+                    "hicache_storage_pass_prefix_keys must be bool, got "
+                    f"{type(self.hicache_storage_pass_prefix_keys).__name__}"
+                )
         self.enable_storage = (
             self.cache_controller is not None
             and getattr(self.cache_controller, "enable_storage", False)
         )
+        self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
 
         logger.info(
             f"HiCache D\u2194H initialized: "
@@ -1305,19 +1328,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def add_full_derived(name: PoolName) -> None:
             entry = entries.get(name)
-            if entry is None or entry.derive_indices_fn is None:
+            if entry is None:
                 return
-            host_indices = entry.derive_indices_fn(full_host_indices)
             keys = self._storage_keys_for_host_indices(
                 hash_values,
-                host_indices,
+                full_host_indices,
                 getattr(entry.host_pool, "page_size", 1) or 1,
                 PoolHitPolicy.ALL_PAGES,
             )
             transfers.append(
                 PoolTransfer(
                     name=name,
-                    host_indices=host_indices,
+                    host_indices=full_host_indices,
                     keys=keys,
                     hit_policy=PoolHitPolicy.ALL_PAGES,
                 )
@@ -1508,7 +1530,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Increment hit count; trigger write_backup when threshold reached."""
         if self.cache_controller is None:
             return
-        if node.evicted or chunked:
+        if node.evicted:
+            return
+        if chunked and not self.enable_storage:
             return
         if self.cache_controller.write_policy == "write_back":
             return
@@ -2350,4 +2374,3 @@ class UnifiedRadixCache(BasePrefixCache):
                     if cd.host_value is not None:
                         self.host_lru_lists[ct].insert_mru(node)
             stack.extend(node.children.values())
-

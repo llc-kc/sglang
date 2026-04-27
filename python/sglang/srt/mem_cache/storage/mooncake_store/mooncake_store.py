@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
-from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.metrics.collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -620,10 +620,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         results: dict = {}
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
-            keys = transfer.keys
+            keys = transfer.keys or []
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
-            assert len(keys) > 0
+            if len(keys) == 0:
+                results[transfer.name] = []
+                continue
             assert len(keys) == len(host_indices) // page_size
 
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)

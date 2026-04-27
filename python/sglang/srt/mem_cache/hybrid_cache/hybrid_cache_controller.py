@@ -496,6 +496,9 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
+                entry = self.mem_pool_host.entry_map.get(transfer.name)
+                if entry is not None and entry.device_pool is None:
+                    continue
                 transfer_host_indices, transfer_device_indices = self.move_indices(
                     transfer.host_indices, transfer.device_indices
                 )
@@ -671,5 +674,4 @@ class HybridCacheController(BaseHiCacheController):
                 if src_pool is not None:
                     pool.host_indices = src_pool.host_indices
                     pool.device_indices = src_pool.device_indices
-            logger.info(f"Resolved pool transfer {pool.name} from {source_name}, assign {pool.host_indices.numel()} indices")
         return extra_pools
