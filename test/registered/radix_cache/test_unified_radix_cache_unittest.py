@@ -795,6 +795,8 @@ class TestUnifiedRadixCacheHelpers(unittest.TestCase):
         kv_size: int = 128,
         max_num_reqs: int = 10,
         max_context_len: int = 128,
+        page_size: int = _PAGE_SIZE,
+        is_eagle: bool = False,
     ):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 
@@ -807,7 +809,7 @@ class TestUnifiedRadixCacheHelpers(unittest.TestCase):
         )
         kv_pool = MHATokenToKVPool(
             size=kv_size,
-            page_size=_PAGE_SIZE,
+            page_size=page_size,
             dtype=_DTYPE,
             head_num=_HEAD_NUM,
             head_dim=_HEAD_DIM,
@@ -826,8 +828,9 @@ class TestUnifiedRadixCacheHelpers(unittest.TestCase):
             params=CacheInitParams(
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=allocator,
-                page_size=_PAGE_SIZE,
+                page_size=page_size,
                 disable=False,
+                is_eagle=is_eagle,
                 tree_components=(
                     ComponentType.FULL,
                 ),  # Full attention only, no mamba/swa
@@ -877,6 +880,16 @@ class TestUnifiedRadixCacheHelpers(unittest.TestCase):
         self.assertEqual(node_count_after_readonly, node_count_after_regular)
 
         tree.sanity_check()
+
+    def test_match_short_key_after_page_alignment(self):
+        """Short prompts can become empty after page alignment."""
+        tree, _ = self._build_tree(page_size=256, is_eagle=True)
+
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
+
+        self.assertEqual(len(result.device_indices), 0)
+        self.assertIs(result.last_device_node, tree.root_node)
+        self.assertIs(result.last_host_node, tree.root_node)
 
 
 if __name__ == "__main__":

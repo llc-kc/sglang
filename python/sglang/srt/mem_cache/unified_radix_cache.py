@@ -436,7 +436,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        if self.disable or len(key) == 0:
+
+        def empty_match_result():
             return MatchResult(
                 device_indices=torch.empty(
                     (0,),
@@ -446,7 +447,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
             )
+
+        if self.disable or len(key) == 0:
+            return empty_match_result()
+
         key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return empty_match_result()
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
