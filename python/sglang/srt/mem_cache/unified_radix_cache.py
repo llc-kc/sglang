@@ -2301,10 +2301,6 @@ class UnifiedRadixCache(BasePrefixCache):
             logger.error(msg)
             self.pretty_print()
             raise AssertionError(msg)
-        logger.debug(
-            f"Sanity check PASSED: {len(all_nodes)} nodes, "
-            f"{len(self.tree_components)} components"
-        )
 
     def _check_lru_linked_list(
         self,
