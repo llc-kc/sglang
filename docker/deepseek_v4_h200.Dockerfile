@@ -3,7 +3,7 @@ FROM lmsysorg/sglang:v0.5.7
 # need: cu12.9, x86_64 docker
 
 RUN mkdir -p /workspace && cd /workspace && rm -rf sglang && \
-    git clone -b deepseek_v4 https://github.com/sgl-project/sglang.git
+    git clone -b deepseek_v4_hicache_update https://github.com/llc-kc/sglang.git
 
 # tilelang 0.1.8 pinned: mhc.py uses T.gemm(wg_wait=0), removed in 0.1.9.
 RUN pip install tilelang==0.1.8
@@ -26,7 +26,7 @@ RUN cd /workspace/sglang/sgl-kernel && make build
 # DeepGEMM depends on at the resolved versions.
 RUN pip uninstall -y deep-gemm deep_gemm 2>/dev/null; \
     cd /tmp && rm -rf DeepGEMM && \
-    git clone https://github.com/sgl-project/DeepGEMM.git -b release && \
+    git clone https://github.com/sgl-project/DeepGEMM.git -b release-0426 && \
     cd DeepGEMM && git checkout 7f2a70 && \
     git submodule update --init --recursive && \
     bash install.sh
