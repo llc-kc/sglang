@@ -588,7 +588,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False
         )
-
+        logger.warning(f"prefetch_timeout_base: {prefetch_timeout_base}, prefetch_timeout_per_ki_token: {prefetch_timeout_per_ki_token}, prefetch_timeout_max: {prefetch_timeout_max}")
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
                 f"prefetch_threshold must be int, got {type(prefetch_threshold).__name__}"
@@ -1279,7 +1279,7 @@ class HiRadixCache(RadixCache):
             or self.cache_controller.prefetch_rate_limited()
         ):
             return
-
+        prefetch_length_expected = prefetch_length
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
@@ -1295,8 +1295,15 @@ class HiRadixCache(RadixCache):
                 )
             else:
                 last_host_node.release_host()
+                logger.error("no L2 host memory for prefetch req {}", req_id)
                 # no sufficient host memory for prefetch
                 return
+        prefetch_length_actual = len(host_indices)
+        if prefetch_length_actual < prefetch_length_expected:
+            logger.warning("prefetch length actual {} < expected {}".format(
+                prefetch_length_actual, prefetch_length_expected
+            ))
+
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,

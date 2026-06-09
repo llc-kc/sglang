@@ -2222,6 +2222,11 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+
+            req.cached_tokens_device_at_prefetch = len(req.prefix_indices)
+            req.cached_tokens_host_at_prefetch = req.host_hit_length
+
+            prefetched = False
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
@@ -2240,6 +2245,10 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+                prefetched = True
+            cached_token_when_prefetch = req.cached_tokens_device_at_prefetch + req.cached_tokens_host_at_prefetch
+            logger.warning(f"req {req.rid} prefetched={prefetched}, backuped={last_host_node.backuped}, {cached_token_when_prefetch=}")
+
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

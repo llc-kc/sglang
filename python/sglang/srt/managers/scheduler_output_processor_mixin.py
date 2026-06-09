@@ -65,6 +65,13 @@ class SchedulerOutputProcessorMixin:
             - {"device": X, "host": Y} without storage breakdown
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
+
+        req.time_stats.cached_tokens_device_at_prefetch = req.cached_tokens_device_at_prefetch
+        req.time_stats.cached_tokens_host_at_prefetch = req.cached_tokens_host_at_prefetch
+        req.time_stats.cached_tokens_device = req.cached_tokens_device
+        req.time_stats.cached_tokens_host = req.cached_tokens_host
+        req.time_stats.cached_tokens_storage = req.cached_tokens_storage
+        req.time_stats.storage_hit_length = req.storage_hit_length
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0

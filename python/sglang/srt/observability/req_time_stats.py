@@ -576,6 +576,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # Number of prefill retries for this request
     prefill_retry_count: int = 0
 
+    cached_tokens_device_at_prefetch: int = 0
+    cached_tokens_host_at_prefetch: int = 0
+    cached_tokens_device: int = 0
+    cached_tokens_host: int = 0
+    cached_tokens_storage: int = 0
+    storage_hit_length: int = 0
+
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not self.enable_metrics:
@@ -974,6 +982,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
+    def convert_cache_str(self):
+        return f"{self.cached_tokens_device_at_prefetch=}, " \
+        f"{self.cached_tokens_host_at_prefetch=}, " \
+        f"{self.cached_tokens_device=}, " \
+        f"{self.cached_tokens_host=}, " \
+        f"{self.cached_tokens_storage=}, " \
+        f"{self.storage_hit_length=}"
+
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
             queue_duration = self.duration_between(
@@ -988,7 +1004,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     queue_duration >= 0 and forward_duration >= 0
                 ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
+            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}, cache_info: {self.convert_cache_str()}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time

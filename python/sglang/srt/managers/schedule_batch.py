@@ -847,6 +847,9 @@ class Req(ReqDllmMixin):
         self.cached_tokens = 0
         self.already_computed = 0
 
+        self.cached_tokens_device_at_prefetch = 0  # Tokens from device cache (GPU)
+        self.cached_tokens_host_at_prefetch = 0  # Tokens from host cache (CPU memory)
+
         # Detailed breakdown of cached tokens by source (for HiCache)
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)

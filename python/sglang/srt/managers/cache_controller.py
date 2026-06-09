@@ -1071,6 +1071,9 @@ class HiCacheController:
                 if operation is None:
                     continue
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+                logger.warning(
+                    f"Storage hit count for request {operation.request_id}: {storage_hit_count}"
+                )
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1083,7 +1086,7 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
+                    logger.warning(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
@@ -1095,7 +1098,7 @@ class HiCacheController:
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
+                    logger.warning(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
