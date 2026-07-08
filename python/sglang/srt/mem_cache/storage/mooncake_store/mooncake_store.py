@@ -311,7 +311,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -735,6 +734,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
         elif pool_name in (
             PoolName.INDEXER,
+            PoolName.DRAFT_INDEXER,
+            PoolName.DRAFT_SWA,
             PoolName.DEEPSEEK_V4_C4,
             PoolName.DEEPSEEK_V4_C4_INDEXER,
             PoolName.DEEPSEEK_V4_C128,

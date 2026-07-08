@@ -176,8 +176,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -1124,6 +1126,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+    def hicache_draft_pool_builders(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
+
+        return (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
