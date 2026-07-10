@@ -7,6 +7,7 @@ from collections import defaultdict
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 
 logger = logging.getLogger(__name__)
@@ -118,16 +119,25 @@ def get_allocator_type(server_args) -> str:
 
 
 def _cuda_host_register(buffer: torch.Tensor) -> None:
+    # Register in chunks of SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB (default 256GB).
+    # Some driver/silicon combinations fail and corrupt the CUDA context when a
+    # single cudaHostRegister call exceeds roughly 500-600GB.
     cudart = torch.cuda.cudart()
-    n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
-    if int(rc) != 0:
-        raise RuntimeError(
-            f"cudaHostRegister failed (rc={int(rc)}, "
-            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-            f"size={n_bytes}; host buffer is not pinned and device transfers "
-            f"may silently return stale data."
-        )
+    base = buffer.data_ptr()
+    total = buffer.numel() * buffer.element_size()
+    chunk_bytes = max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
+    offset = 0
+    while offset < total:
+        size = min(chunk_bytes, total - offset)
+        rc = int(cudart.cudaHostRegister(base + offset, size, 0))
+        if rc != 0:
+            raise RuntimeError(
+                f"cudaHostRegister failed (rc={rc}, "
+                f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
+                f"pinned and device transfers may silently return stale data."
+            )
+        offset += size
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
