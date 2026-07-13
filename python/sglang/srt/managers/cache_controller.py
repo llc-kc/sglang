@@ -38,6 +38,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    maybe_build_mla_broadcaster,
+    storage_supports_host_dedup,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -218,6 +223,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
+        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
+        enable_mla_hicache_host_dedup: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -275,6 +282,21 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
+        if mla_dedup_prebuild is not None:
+            self.mla_broadcaster = mla_dedup_prebuild.broadcaster
+            self._prebuilt_prefetch_sync_groups = (
+                mla_dedup_prebuild.prefetch_sync_groups
+            )
+        else:
+            self.mla_broadcaster = maybe_build_mla_broadcaster(
+                self.mem_pool_device,
+                self.tp_group,
+                self.attn_tp_group,
+                storage_backend,
+                enable_mla_hicache_host_dedup,
+            )
+            self._prebuilt_prefetch_sync_groups = None
+
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
         if storage_backend is not None:
@@ -289,6 +311,20 @@ class HiCacheController:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
+    @property
+    def mla_broadcast_enabled(self) -> bool:
+        return self.mla_broadcaster is not None
+
+    @property
+    def _mla_skip_host_io(self) -> bool:
+        broadcaster = getattr(self, "mla_broadcaster", None)
+        return broadcaster is not None and not broadcaster.is_src
+
+    def _destroy_mla_broadcast_group(self) -> None:
+        if self.mla_broadcaster is not None:
+            self.mla_broadcaster.destroy()
+            self.mla_broadcaster = None
+
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
         if self.attn_cp_group is not None:
@@ -299,6 +335,10 @@ class HiCacheController:
         return 0, 1
 
     def _create_prefetch_sync_groups(self) -> None:
+        if self._prebuilt_prefetch_sync_groups is not None:
+            self.prefetch_sync_groups = self._prebuilt_prefetch_sync_groups
+            self._prebuilt_prefetch_sync_groups = None
+            return
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         self.prefetch_sync_groups = []
@@ -418,6 +458,19 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+
+        if self.mla_broadcast_enabled and self.has_draft:
+            raise RuntimeError(
+                "Draft HiCache L3 storage is not supported with MLA host-memory dedup."
+            )
+
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            storage_backend
+        ):
+            raise RuntimeError(
+                "The selected HiCache storage backend is incompatible with MLA "
+                "host-memory dedup."
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -668,6 +721,7 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
+        self.write_queue.clear()
         # Kernel write-back keeps host indices on CPU only for page_first AND only
         # when the staged JIT write-back kernel is available (it stages through
         # device memory and accepts CPU destination indices). Otherwise we fall back
@@ -676,17 +730,23 @@ class HiCacheController:
         # device first. Without the can_use_write_back_jit check this crashes on
         # backends where the JIT kernel is unavailable, with
         # "Destination indices must be a CUDA tensor".
-        if (
-            self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
-        ):
-            host_indices, device_indices = op.host_indices, op.device_indices
-        else:
-            host_indices, device_indices = self.move_indices(
-                op.host_indices, op.device_indices
+        if self._mla_skip_host_io and not self.has_draft:
+            start_event = device_module.Event()
+            finish_event = device_module.Event()
+            start_event.record()
+            finish_event.record()
+            self.ack_write_queue.append(
+                HiCacheAck(start_event, finish_event, op.node_ids)
             )
-        self.write_queue.clear()
+            return
+
+        target_host_indices, target_device_indices = self._resolve_write_indices(
+            op, self.mem_pool_host
+        )
+        if self.has_draft:
+            draft_host_indices, draft_device_indices = self._resolve_write_indices(
+                op, self.mem_pool_host_draft
+            )
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -694,26 +754,52 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
-            )
+            if not self._mla_skip_host_io:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    target_host_indices,
+                    target_device_indices,
+                    self.io_backend,
+                )
             if self.has_draft:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
+                    draft_host_indices,
+                    draft_device_indices,
                     self.io_backend,
                 )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
+            self._record_indices_on_write_stream(
+                target_host_indices, target_device_indices
+            )
+            if self.has_draft:
+                self._record_indices_on_write_stream(
+                    draft_host_indices, draft_device_indices
+                )
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+
+    def _resolve_write_indices(
+        self, op: CacheOperation, host_pool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.io_backend == "kernel"
+            and host_pool.layout == "page_first"
+            and getattr(host_pool, "can_use_write_back_jit", False)
+        ):
+            return op.host_indices, op.device_indices
+        return self.move_indices(op.host_indices, op.device_indices)
+
+    def _record_indices_on_write_stream(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> None:
+        if host_indices.is_cuda:
+            host_indices.record_stream(self.write_stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(self.write_stream)
 
     def load(
         self,
@@ -760,10 +846,12 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        self.load_queue.clear()
+        if self.mla_broadcast_enabled:
+            return self._start_loading_mla(producer_id, op)
         host_indices, device_indices = self.move_indices(
             op.host_indices, op.device_indices
         )
-        self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -803,6 +891,55 @@ class HiCacheController:
         )
         return producer_id
 
+    def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
+        with device_module.stream(self.load_stream):
+            producer_event.start_event.wait(self.load_stream)
+            if self.mla_broadcaster.is_src:
+                self._load_mla_on_src_rank(op)
+                self.load_stream.synchronize()
+            self.mla_broadcaster.broadcast_loaded(op.device_indices, self.load_stream)
+            self._load_draft_on_all_ranks(op)
+            for i in range(self.layer_num):
+                producer_event.complete(i)
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=producer_event.start_event,
+                finish_event=producer_event.finish_event,
+                node_ids=op.node_ids,
+            )
+        )
+        return producer_id
+
+    def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
+        for i in range(self.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                i,
+                self.io_backend,
+            )
+
+    def _load_draft_on_all_ranks(self, op: CacheOperation) -> None:
+        if not self.has_draft:
+            return
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
+        for i in range(self.mem_pool_host_draft.layer_num):
+            self.mem_pool_host_draft.load_to_device_per_layer(
+                self.mem_pool_device_draft,
+                host_indices,
+                device_indices,
+                i,
+                self.io_backend,
+            )
+
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
         return len(device_indices)
@@ -816,6 +953,10 @@ class HiCacheController:
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
         """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
+        if self.mla_broadcast_enabled and self.enable_storage:
+            raise NotImplementedError(
+                "Draft HiCache L3 storage is not supported with MLA host-memory dedup."
+            )
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool

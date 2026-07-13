@@ -26,6 +26,11 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    is_mla_dedup_dummy_rank,
+    maybe_prebuild_mla_host_dedup,
+)
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
 if TYPE_CHECKING:
@@ -122,6 +127,8 @@ def build_kv_only_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    is_dummy: bool = False,
+    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -130,6 +137,7 @@ def build_kv_only_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
+        is_dummy=is_dummy,
     )
     entries = [
         build_pool_entry(
@@ -159,6 +167,8 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        mla_dedup_prebuild=mla_dedup_prebuild,
+        enable_mla_hicache_host_dedup=server_args.enable_mla_hicache_host_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -1113,6 +1123,17 @@ class _PlainKvStrategy(StackStrategy):
 
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
+        mla_is_dummy = is_mla_dedup_dummy_rank(
+            kvcache, storage_backend, server_args.enable_mla_hicache_host_dedup
+        )
+        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
+            kvcache,
+            params.tp_cache_group,
+            attn_cp_group,
+            attn_tp_group,
+            storage_backend,
+            server_args.enable_mla_hicache_host_dedup,
+        )
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
         host_pool_group, cache_controller = build_kv_only_stack(
             params=params,
@@ -1131,6 +1152,8 @@ class _PlainKvStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            is_dummy=mla_is_dummy,
+            mla_dedup_prebuild=mla_dedup_prebuild,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
