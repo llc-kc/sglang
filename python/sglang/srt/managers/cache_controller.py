@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    PoolTransferResult,
     SidecarPoolSpec,
 )
 
@@ -483,7 +484,7 @@ class HiCacheController:
                 f"{storage_backend!r} while MLA/NSA host-memory dedup is "
                 f"active: non-rank-0 attn-TP ranks hold dummy host pools "
                 f"(kv_buffer=None) and this backend would dereference them. "
-                f"Only None/''/'file' backends can attach later in dedup "
+                f"Only None/''/'file'/'mooncake' backends can attach later in dedup "
                 f"mode. Restart the server with "
                 f"--hicache-storage-backend={storage_backend} to use this "
                 f"backend (every rank will then keep a full host pool)."
@@ -521,14 +522,10 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
-            # Dummy host pool: no buffer to register; this rank never reads L3.
-            if getattr(self.mem_pool_host, "_is_dummy", False):
-                logger.info(
-                    "Skipping register_mem_pool_host on dummy (non-rank-0 dedup) "
-                    "host pool with no KV buffer."
-                )
-            else:
-                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            # Registration also binds the logical anchor object. Mooncake's
+            # implementation detects kv_buffer=None and skips buffer pinning,
+            # while retaining the anchor for v1/v2 logical-target semantics.
+            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -750,15 +747,6 @@ class HiCacheController:
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
-        if self._mla_skip_host_io:
-            # Dummy host pool on this rank: skip D2H, just ack.
-            start_event.record()
-            finish_event.record()
-            self.ack_write_queue.append(
-                HiCacheAck(start_event, finish_event, op.node_ids)
-            )
-            return
-
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
         if (
             self.io_backend == "kernel"
@@ -774,9 +762,10 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
-            )
+            if not self._mla_skip_host_io:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device, host_indices, device_indices, self.io_backend
+                )
             if self.has_draft:
                 for _spec, entry in self._kv_indexed_draft_pools():
                     entry.host_pool.backup_from_device_all_layer(
@@ -903,8 +892,14 @@ class HiCacheController:
             producer_event.start_event.wait(self.load_stream)
             if self.mla_broadcaster.is_src:
                 self._load_mla_on_src_rank(op)
+
+            # Draft KV is rank-local for EAGLE/MTP/DFLASH.  Every rank loads
+            # its own draft sidecars; only target MLA/DSA state is broadcast.
+            self._load_rank_local_draft_pools(op)
+
+            if self.mla_broadcaster.is_src:
                 # "direct" may issue H2D off load_stream; land it fully
-                # before the broadcast reads the device KV buffer.
+                # before the broadcast reads the device target KV buffer.
                 self.load_stream.synchronize()
 
             self.mla_broadcaster.broadcast_loaded(op.device_indices, self.load_stream)
@@ -919,6 +914,26 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def _load_rank_local_draft_pools(self, op: CacheOperation) -> None:
+        if not self.has_draft:
+            return
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
+        for spec, entry in self._kv_indexed_draft_pools():
+            for layer_id in range(entry.host_pool.layer_num):
+                entry.host_pool.load_to_device_per_layer(
+                    entry.device_pool,
+                    host_indices,
+                    device_indices,
+                    layer_id,
+                    self.io_backend,
+                )
+        if host_indices.is_cuda:
+            host_indices.record_stream(self.load_stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(self.load_stream)
 
     def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
         """Src-rank H2D; subclasses override to add their pool transfers."""
@@ -1136,10 +1151,20 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
-        # Dummy host pool: only the src rank reads L3; mark complete so the
-        # MIN-synced cross-rank accounting stays consistent.
+        # Only target L3 IO is skipped on a non-owner dedup rank. Draft
+        # sidecars are rank-local and still have to be fetched on every rank.
         if self._mla_skip_host_io:
-            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_host_indices = operation.host_indices[
+                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                ]
+                if self.has_draft and not self._draft_page_get(
+                    batch_hashes, batch_host_indices
+                ):
+                    operation.mark_terminate()
+                    break
+                operation.completed_tokens += len(batch_hashes) * self.page_size
             return
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
@@ -1149,11 +1174,12 @@ class HiCacheController:
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
 
-            # Best-effort draft L3 read before publishing target completion.
-            # Otherwise wait_complete can race and load back target KV before
-            # draft KV reaches host memory.
+            # Draft is required speculative state. Load it before publishing
+            # target completion so wait_complete cannot observe a partial hit.
             if self.has_draft:
-                self._draft_page_get(batch_hashes, batch_host_indices)
+                if not self._draft_page_get(batch_hashes, batch_host_indices):
+                    operation.mark_terminate()
+                    break
 
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
@@ -1211,7 +1237,21 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            if self.has_draft and self.storage_backend_type == "mooncake":
+                hit_result: PoolTransferResult = self.storage_backend.batch_exists_v2(
+                    batch_hashes,
+                    self._draft_pool_transfers(batch_hashes, None),
+                    extra_info,
+                )
+                hit_page_num = hit_result.kv_hit_pages
+            elif self._mla_skip_host_io:
+                # The owner rank checks the shared target objects; MIN sync in
+                # prefetch_thread_func propagates its prefix to this rank.
+                hit_page_num = len(batch_hashes)
+            else:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1297,33 +1337,39 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
-    def _draft_page_set(self, hash_values, host_indices) -> None:
-        """Best-effort write draft KV pages to L3 alongside the target backup."""
+    def _draft_page_set(self, hash_values, host_indices) -> bool:
+        """Write required rank-local draft KV pages alongside the target."""
         if self.draft_page_set_func is None:
-            return
+            return True
         try:
-            self.draft_page_set_func(hash_values, host_indices)
+            result = self.draft_page_set_func(hash_values, host_indices)
+            if isinstance(result, dict) and any(not all(v) for v in result.values()):
+                return False
+            return True
         except Exception:
-            logger.debug(
-                "Draft L3 write failed (best-effort), skipping.", exc_info=True
-            )
+            logger.warning("Draft L3 write failed.", exc_info=True)
+            return False
 
-    def _draft_page_get(self, hash_values, host_indices) -> None:
-        """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`)."""
+    def _draft_page_get(self, hash_values, host_indices) -> bool:
+        """Read required rank-local draft KV pages from L3."""
         if self.draft_page_get_func is None:
-            return
+            return True
         try:
-            self.draft_page_get_func(hash_values, host_indices)
+            result = self.draft_page_get_func(hash_values, host_indices)
+            if isinstance(result, dict) and any(not all(v) for v in result.values()):
+                return False
+            return True
         except Exception:
-            logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
+            logger.warning("Draft L3 read failed.", exc_info=True)
+            return False
 
     def _draft_page_set_v2(self, hash_values, host_indices) -> None:
-        self.storage_backend.batch_set_v2(
+        return self.storage_backend.batch_set_v2(
             self._draft_pool_transfers(hash_values, host_indices)
         )
 
     def _draft_page_get_v2(self, hash_values, host_indices) -> None:
-        self.storage_backend.batch_get_v2(
+        return self.storage_backend.batch_get_v2(
             self._draft_pool_transfers(hash_values, host_indices)
         )
 
@@ -1370,19 +1416,27 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
-            # Set one batch token, and record if success.
-            # todo: allow partial success
+            # Target MLA/DSA is shared and written by its owner only. Draft
+            # sidecars below are rank-local and are written by every rank.
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = True
+            if not self.backup_skip:
+                success = self.page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
+                )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
 
-            # Best-effort draft L3 write alongside target.
             if self.has_draft:
-                self._draft_page_set(batch_hashes, batch_host_indices)
+                if not self._draft_page_set(batch_hashes, batch_host_indices):
+                    logger.warning(
+                        "Write draft pages to storage: %d pages failed.",
+                        len(batch_hashes),
+                    )
+                    break
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
@@ -1398,8 +1452,7 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup(operation)
+                self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

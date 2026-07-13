@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    is_rank_local_draft_pool,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.mem_cache.mla_host_dedup import (
@@ -433,14 +434,6 @@ class HybridCacheController(BaseHiCacheController):
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
-        if self._mla_skip_host_io:
-            # MLA/DSA dedup: dummy host pools on this rank; skip D2H, just ack.
-            start_event.record()
-            finish_event.record()
-            self.ack_write_queue.append(
-                HiCacheAck(start_event, finish_event, op.node_ids)
-            )
-            return
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
         if (
             self.io_backend == "kernel"
@@ -457,13 +450,14 @@ class HybridCacheController(BaseHiCacheController):
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                self.io_backend,
-                pool_transfers=resolved_pool_transfers,
-            )
+            if not self._mla_skip_host_io:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                    pool_transfers=resolved_pool_transfers,
+                )
             if self.has_draft:
                 draft_pool_transfers = list(
                     self._draft_pool_transfers_from_source_indices(
@@ -494,6 +488,30 @@ class HybridCacheController(BaseHiCacheController):
                 resolved_pool_transfers,
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+
+    @staticmethod
+    def _rank_local_draft_transfers(
+        pool_transfers: Optional[list[PoolTransfer]],
+    ) -> list[PoolTransfer]:
+        return [
+            transfer
+            for transfer in pool_transfers or []
+            if is_rank_local_draft_pool(transfer.name)
+        ]
+
+    def _backup_rank_local_pool_transfers(
+        self, pool_transfers: list[PoolTransfer]
+    ) -> None:
+        for transfer in pool_transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            entry.host_pool.backup_from_device_all_layer(
+                entry.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                self.io_backend,
+            )
 
     def load(
         self,
@@ -625,6 +643,36 @@ class HybridCacheController(BaseHiCacheController):
             resolved_pool_transfers,
         )
 
+    def _load_rank_local_draft_pools(self, op: CacheOperation) -> None:
+        # HiRadix registers draft pools directly on the controller, while the
+        # unified radix cache represents them as ordinary sidecar transfers.
+        super()._load_rank_local_draft_pools(op)
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
+        )
+        draft_transfers = self._rank_local_draft_transfers(resolved_pool_transfers)
+        for transfer in draft_transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            for layer_id in range(self.layer_num):
+                local_layer_id = entry.layer_mapper(layer_id)
+                if local_layer_id is None:
+                    continue
+                entry.host_pool.load_to_device_per_layer(
+                    entry.device_pool,
+                    transfer.host_indices,
+                    transfer.device_indices,
+                    local_layer_id,
+                    self.io_backend,
+                )
+        self._record_transfer_indices_on_stream(
+            self.load_stream,
+            host_indices,
+            device_indices,
+            draft_transfers,
+        )
+
     def _record_transfer_indices_on_stream(
         self,
         stream: torch.Stream,
@@ -716,9 +764,29 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
-        if operation.pool_transfers:
+        controller_draft_transfers = (
+            self._draft_pool_transfers(hash_value, None)
+            if self.has_draft and self.storage_backend_type == "mooncake"
+            else []
+        )
+        if self._mla_skip_host_io:
+            # Shared target/indexer objects are checked by the owner rank.
+            # This rank still constrains the common prefix by its local draft.
+            draft_transfers = self._rank_local_draft_transfers(operation.pool_transfers)
+            draft_transfers.extend(controller_draft_transfers)
+            if draft_transfers:
+                hit_result = self.storage_backend.batch_exists_v2(
+                    hash_value, draft_transfers, extra_info
+                )
+            else:
+                hit_result = PoolTransferResult(
+                    kv_hit_pages=len(hash_value), extra_pool_hit_pages={}
+                )
+        elif operation.pool_transfers or controller_draft_transfers:
+            pool_transfers = list(operation.pool_transfers or [])
+            pool_transfers.extend(controller_draft_transfers)
             hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
+                hash_value, pool_transfers, extra_info
             )
         else:
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
@@ -763,12 +831,29 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
-        # Dummy host pools (KV and indexer): no L3 reads on this rank. Must
-        # precede super()._page_transfer and the sidecar batch_get below;
-        # pool_transfers_done lets this rank pass the all-reduced termination
-        # check.
+        # Shared target pools are logical/dummy on this rank, but draft pools
+        # are real rank-local state and must still be fetched.
         if self._mla_skip_host_io:
-            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            # Handles controller-registered HiRadix draft pools and advances
+            # the logical target completion count without touching target IO.
+            super()._page_transfer(operation)
+            if operation.is_terminated():
+                operation.pool_transfers_done = True
+                return
+            draft_transfers = self._rank_local_draft_transfers(operation.pool_transfers)
+            if draft_transfers:
+                self._sync_trailing_keys(
+                    draft_transfers,
+                    operation.hash_value,
+                    len(operation.hash_value),
+                )
+                self._resolve_sidecar_derived_pool_transfers(operation)
+                results = self.storage_backend.batch_get_v2(draft_transfers)
+                operation.pool_storage_result.update_extra_pool_hit_pages(results)
+                if any(not all(pool_results) for pool_results in results.values()):
+                    operation.mark_terminate()
+                    operation.pool_transfers_done = True
+                    return
             operation.pool_transfers_done = True
             return
 
@@ -786,14 +871,21 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            if any(not all(pool_results) for pool_results in results.values()):
+                operation.mark_terminate()
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
         # Backup extra pools
-        if operation.pool_transfers:
+        pool_transfers = operation.pool_transfers
+        if self.backup_skip:
+            pool_transfers = self._rank_local_draft_transfers(pool_transfers)
+        if pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_set_v2(pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            if any(not all(pool_results) for pool_results in results.values()):
+                return
 
         # Backup kv pools
         super()._page_backup(operation)

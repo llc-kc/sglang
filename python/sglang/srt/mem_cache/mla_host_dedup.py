@@ -36,10 +36,10 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-# Backends that never touch the host KV buffer directly, so they tolerate
-# the buffer-less dummy pools. RDMA/registered backends (mooncake/eic/simm/
-# hf3fs/nixl/aibrix) pin or register the buffer — dedup stays off for them.
-_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
+# Backends that tolerate a logical target anchor with no host KV buffer.
+# Mooncake keeps real per-rank draft sidecars on non-owner ranks. Other RDMA
+# backends pin or register the target buffer and therefore remain excluded.
+_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file", "mooncake"})
 
 
 def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:

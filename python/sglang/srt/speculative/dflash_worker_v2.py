@@ -283,6 +283,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
+    def hicache_draft_pool_builders(self):
+        """Expose all DFLASH draft KV layouts as rank-local HiCache pools."""
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
+
+        return (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
+
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
 
