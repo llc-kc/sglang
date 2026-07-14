@@ -33,6 +33,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    storage_supports_host_dedup,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -112,6 +116,8 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
+        enable_mla_hicache_host_dedup: bool = False,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -131,12 +137,32 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            mla_dedup_prebuild=mla_dedup_prebuild,
+            enable_mla_hicache_host_dedup=enable_mla_hicache_host_dedup,
         )
+        # The base gate ran with storage_backend=None; re-apply it with the
+        # real startup backend so broadcast never runs against full
+        # (non-dummy) pools.
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            startup_storage_backend
+        ):
+            self._destroy_mla_broadcast_group()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
+            # The broadcast indexes the MLA KV buffer by layer_num; an
+            # expanded transfer layer count (e.g. +Mamba state) would index
+            # out of bounds and the extra pools aren't deduped — disable.
+            if self.mla_broadcast_enabled:
+                logger.info(
+                    "Disabling MLA host-dedup broadcast: transfer layer count "
+                    "(%d) exceeds the MLA KV layers, so extra hybrid pools "
+                    "(e.g. Mamba) are not deduplicated.",
+                    self.layer_num,
+                )
+                self._destroy_mla_broadcast_group()
 
         if startup_storage_backend is not None:
             self.attach_storage_backend(
@@ -167,6 +193,9 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            # Dummy pool: nothing to register; this rank never reads L3.
+            if getattr(entry.host_pool, "_is_dummy", False):
+                continue
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
@@ -638,6 +667,15 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
+        # Dummy host pools (KV and indexer): no L3 reads on this rank. Must
+        # precede super()._page_transfer and the sidecar batch_get below;
+        # pool_transfers_done lets this rank pass the all-reduced termination
+        # check.
+        if self._mla_skip_host_io:
+            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            operation.pool_transfers_done = True
+            return
+
         # KV pools first — determines actual completed page count
         super()._page_transfer(operation)
 
