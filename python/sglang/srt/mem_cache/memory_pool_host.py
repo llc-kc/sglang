@@ -1557,6 +1557,17 @@ class HostPoolGroup:
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
 
+    def get_size_per_token(self):
+        # Some storage-backend factories (e.g. HF3FS) call this as a method on
+        # the host pool; delegate to the anchor pool so a HostPoolGroup works.
+        return self.anchor_entry.host_pool.get_size_per_token()
+
+    @property
+    def _is_dummy(self):
+        # Surface the anchor (KV) pool's dummy flag so dedup-aware guards
+        # (e.g. skipping register_mem_pool_host) fire for the grouped case too.
+        return getattr(self.anchor_entry.host_pool, "_is_dummy", False)
+
     @property
     def allocator(self):
         return self.anchor_entry.host_pool.allocator
@@ -1685,7 +1696,9 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        is_dummy: bool = False,
     ):
+        self._is_dummy = is_dummy
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -1715,6 +1728,20 @@ class DSAIndexerPoolHost(HostKVCache):
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
+
+        if is_dummy:
+            # Non-rank-0 DSA dedup: allocator-only, indexer data arrives via
+            # broadcast at load time, so skip the host buffer allocation.
+            self.index_k_with_scale_buffer = None
+            self.index_k_device_ptrs = None
+            logger.info(
+                "DSAIndexerPoolHost dummy mode: allocator-only, size=%d tokens, "
+                "skipping indexer buffer allocation",
+                self.size,
+            )
+            self.lock = threading.RLock()
+            self.clear()
+            return
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
