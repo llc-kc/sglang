@@ -567,7 +567,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
+        if any(
+            existing.pool_name == spec.pool_name for existing in self.sidecar_pool_specs
+        ):
+            raise ValueError(f"Sidecar pool {spec.pool_name} is already registered.")
         self.sidecar_pool_specs.append(spec)
+
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[Any]
+    ) -> None:
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache controller is not attached.")
+        register_host_pool_entry = getattr(
+            self.cache_controller, "register_host_pool_entry", None
+        )
+        if register_host_pool_entry is None:
+            raise TypeError(
+                "The attached HiCache controller does not support dynamic pool "
+                "registration."
+            )
+        entries_by_name = {entry.name: entry for entry in entries}
+        for spec in specs:
+            entry = entries_by_name.get(spec.pool_name)
+            if entry is None:
+                raise ValueError(
+                    f"Missing host pool entry for sidecar {spec.pool_name}."
+                )
+            # The controller owns physical host buffers, while the unified tree
+            # owns the transfer descriptor. Both registrations are required.
+            register_host_pool_entry(entry)
+            self.register_sidecar_pool(spec)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)

@@ -91,40 +91,49 @@ def maybe_register_hicache_draft(
     if draft_kv_pool is None:
         return
 
-    from sglang.srt.mem_cache.memory_pool import (
-        HybridLinearKVPool,
-        MHATokenToKVPool,
-        MLATokenToKVPool,
+    build_hicache_draft_pools = getattr(draft_worker, "build_hicache_draft_pools", None)
+    register_hicache_draft_pools = getattr(
+        tree_cache, "register_hicache_draft_pools", None
     )
-    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
-    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+    if (
+        build_hicache_draft_pools is not None
+        and register_hicache_draft_pools is not None
+    ):
+        draft_pool_specs, draft_pool_entries = build_hicache_draft_pools(
+            draft_kv_pool=draft_kv_pool,
+            tree_cache=tree_cache,
+            server_args=server_args,
+        )
+        if draft_pool_specs or draft_pool_entries:
+            # Unified HiCache needs both host buffers and tree descriptors so
+            # derived indices are available in its L2 and L3 paths.
+            register_hicache_draft_pools(draft_pool_specs, draft_pool_entries)
+            logger.info(
+                "HiCache draft pools registered: %s",
+                [str(spec.pool_name) for spec in draft_pool_specs],
+            )
+            return
 
-    pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        pool = pool.full_kv_pool
-
-    # Create host pool for draft with the same slot count as the target host pool,
-    # so that host indices stay 1-to-1 between target and draft KV caches.
-    primary = tree_cache.cache_controller.mem_pool_host
-    kw = dict(
-        host_to_device_ratio=primary.size / pool.size,
-        host_size=0,
-        page_size=page_size,
-        layout=server_args.hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        build_full_draft_pools,
     )
-    if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
-    elif isinstance(pool, MLATokenToKVPool):
-        draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
-    else:
+
+    draft_pool_specs, draft_pool_entries = build_full_draft_pools(
+        draft_kv_pool=draft_kv_pool,
+        tree_cache=tree_cache,
+        server_args=server_args,
+    )
+    if not draft_pool_specs and not draft_pool_entries:
         logger.warning(
             "Draft pool type %s not supported for HiCache, skipping.",
-            type(pool).__name__,
+            type(draft_kv_pool).__name__,
         )
         return
 
-    tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+    tree_cache.cache_controller.register_draft_pools(
+        draft_pool_specs,
+        draft_pool_entries,
+    )
 
 
 def build_kv_cache(

@@ -736,6 +736,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
         elif pool_name in (
             PoolName.INDEXER,
+            PoolName.DRAFT_INDEXER,
+            PoolName.DRAFT_SWA,
             PoolName.DEEPSEEK_V4_C4,
             PoolName.DEEPSEEK_V4_C4_INDEXER,
             PoolName.DEEPSEEK_V4_C128,
