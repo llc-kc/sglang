@@ -721,6 +721,19 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
+    def hicache_draft_pool_builders(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
+
+        # Draft full KV/DSA reuses target KV slots; draft SWA reuses target SWA slots.
+        # This lets each target cache transfer restore its corresponding draft state.
+        return (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
+
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
 

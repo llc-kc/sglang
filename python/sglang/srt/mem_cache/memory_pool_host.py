@@ -60,7 +60,6 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 
 class MambaPoolHost(HostKVCache):
-
     def __init__(
         self,
         device_pool: MambaPool,
@@ -448,8 +447,7 @@ class MambaPoolHost(HostKVCache):
     ):
         if io_backend != "direct":
             raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
+                f"MambaPoolHost only supports io_backend='direct', got '{io_backend}'."
             )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_pf_lf(
@@ -493,8 +491,7 @@ class MambaPoolHost(HostKVCache):
     ):
         if io_backend != "direct":
             raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
+                f"MambaPoolHost only supports io_backend='direct', got '{io_backend}'."
             )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_all_layers_lf_pf(
@@ -1500,6 +1497,15 @@ class HostPoolGroup:
         self.can_use_write_back_jit = all(
             getattr(entry.host_pool, "can_use_write_back_jit", False)
             for entry in entries
+        )
+
+    def add_entry(self, entry: PoolEntry) -> None:
+        if entry.name in self.entry_map:
+            raise ValueError(f"Host pool {entry.name} is already registered.")
+        self.entries.append(entry)
+        self.entry_map[entry.name] = entry
+        self.can_use_write_back_jit = self.can_use_write_back_jit and getattr(
+            entry.host_pool, "can_use_write_back_jit", False
         )
 
     @property

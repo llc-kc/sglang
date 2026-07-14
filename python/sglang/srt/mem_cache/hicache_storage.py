@@ -73,6 +73,8 @@ class PoolName(str, Enum):
 
     # Draft KV pool
     DRAFT = "draft"
+    DRAFT_INDEXER = "draft_indexer"
+    DRAFT_SWA = "draft_swa"
 
     def __str__(self) -> str:
         return self.value
@@ -350,7 +352,6 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):

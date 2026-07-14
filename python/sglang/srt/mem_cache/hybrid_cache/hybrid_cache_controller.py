@@ -229,6 +229,15 @@ class HybridCacheController(BaseHiCacheController):
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
+    def register_host_pool_entry(self, entry: PoolEntry) -> None:
+        if not hasattr(self.mem_pool_host, "add_entry"):
+            raise TypeError("Dynamic HiCache pool registration requires HostPoolGroup.")
+        self.mem_pool_host.add_entry(entry)
+        if not entry.is_primary_index_anchor:
+            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+        if self.enable_storage and self.storage_backend is not None:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
     @staticmethod
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
@@ -420,13 +429,28 @@ class HybridCacheController(BaseHiCacheController):
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
-            if self.has_draft and host_indices.numel() > 0:
-                self.mem_pool_host_draft.backup_from_device_all_layer(
-                    self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
+            if self.has_draft:
+                draft_pool_transfers = list(
+                    self._draft_pool_transfers_from_source_indices(
+                        self._draft_source_indices_from_pool_transfers(
+                            host_indices, device_indices, resolved_pool_transfers
+                        )
+                    )
                 )
+                for (
+                    _spec,
+                    entry,
+                    draft_host_indices,
+                    draft_device_indices,
+                ) in draft_pool_transfers:
+                    entry.host_pool.backup_from_device_all_layer(
+                        entry.device_pool,
+                        draft_host_indices,
+                        draft_device_indices,
+                        self.io_backend,
+                    )
+            else:
+                draft_pool_transfers = []
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
@@ -492,6 +516,17 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            draft_pool_transfers = (
+                list(
+                    self._draft_pool_transfers_from_source_indices(
+                        self._draft_source_indices_from_pool_transfers(
+                            host_indices, device_indices, resolved_pool_transfers
+                        )
+                    )
+                )
+                if self.has_draft
+                else []
+            )
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -501,18 +536,21 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
-                if (
-                    self.has_draft
-                    and host_indices.numel() > 0
-                    and i < self.mem_pool_host_draft.layer_num
-                ):
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
+                if self.has_draft:
+                    for (
+                        _spec,
+                        entry,
+                        draft_host_indices,
+                        draft_device_indices,
+                    ) in draft_pool_transfers:
+                        if i < entry.host_pool.layer_num:
+                            entry.host_pool.load_to_device_per_layer(
+                                entry.device_pool,
+                                draft_host_indices,
+                                draft_device_indices,
+                                i,
+                                self.io_backend,
+                            )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,
@@ -545,6 +583,34 @@ class HybridCacheController(BaseHiCacheController):
                 transfer.host_indices.record_stream(stream)
             if transfer.device_indices is not None and transfer.device_indices.is_cuda:
                 transfer.device_indices.record_stream(stream)
+
+    def _draft_source_indices_from_pool_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> dict[PoolName, tuple[torch.Tensor, torch.Tensor]]:
+        sources = {PoolName.KV: (host_indices, device_indices)}
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is None or transfer.device_indices is None:
+                continue
+            sources[transfer.name] = (transfer.host_indices, transfer.device_indices)
+        return sources
+
+    def _draft_pool_transfers_from_source_indices(
+        self, source_indices: dict[PoolName, tuple[torch.Tensor, torch.Tensor]]
+    ):
+        for spec, entry in self._draft_pools():
+            source = source_indices.get(spec.indices_from_pool)
+            if source is None:
+                logger.debug(
+                    "Skipping draft pool %s: source pool %s is unavailable.",
+                    spec.pool_name,
+                    spec.indices_from_pool,
+                )
+                continue
+            host_indices, device_indices = source
+            yield (spec, entry, host_indices, device_indices)
 
     def prefetch(
         self,

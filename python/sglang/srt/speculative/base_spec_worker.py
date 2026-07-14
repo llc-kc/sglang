@@ -15,8 +15,11 @@ if _is_cpu:
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.hicache_storage import SidecarPoolSpec
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
@@ -321,6 +324,31 @@ class BaseSpecWorker(ABC):
 
     def alloc_memory_pool(self, **kwargs):
         pass
+
+    def hicache_draft_pool_builders(self) -> tuple[Any, ...]:
+        """Return worker-specific draft-sidecar builders; empty results opt out."""
+        return ()
+
+    def build_hicache_draft_pools(
+        self,
+        *,
+        draft_kv_pool: Any,
+        tree_cache: Any,
+        server_args: ServerArgs,
+    ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+        specs: list[SidecarPoolSpec] = []
+        entries: list[PoolEntry] = []
+        # Compose sidecars keyed by the same source slots as their target state,
+        # so target transfers also restore the corresponding draft state.
+        for builder in self.hicache_draft_pool_builders():
+            builder_specs, builder_entries = builder(
+                draft_kv_pool=draft_kv_pool,
+                tree_cache=tree_cache,
+                server_args=server_args,
+            )
+            specs.extend(builder_specs)
+            entries.extend(builder_entries)
+        return specs, entries
 
     def init_attention_backends(self):
         pass
