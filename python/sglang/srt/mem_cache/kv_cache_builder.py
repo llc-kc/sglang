@@ -91,6 +91,29 @@ def maybe_register_hicache_draft(
     if draft_kv_pool is None:
         return
 
+    build_hicache_draft_pools = getattr(draft_worker, "build_hicache_draft_pools", None)
+    register_hicache_draft_pools = getattr(
+        tree_cache, "register_hicache_draft_pools", None
+    )
+    if (
+        build_hicache_draft_pools is not None
+        and register_hicache_draft_pools is not None
+    ):
+        draft_pool_specs, draft_pool_entries = build_hicache_draft_pools(
+            draft_kv_pool=draft_kv_pool,
+            tree_cache=tree_cache,
+            server_args=server_args,
+        )
+        if draft_pool_specs or draft_pool_entries:
+            # Unified HiCache needs both host buffers and tree descriptors so
+            # derived indices are available in its L2 and L3 paths.
+            register_hicache_draft_pools(draft_pool_specs, draft_pool_entries)
+            logger.info(
+                "HiCache draft pools registered: %s",
+                [str(spec.pool_name) for spec in draft_pool_specs],
+            )
+            return
+
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MHATokenToKVPool,
@@ -103,8 +126,7 @@ def maybe_register_hicache_draft(
     if isinstance(pool, HybridLinearKVPool):
         pool = pool.full_kv_pool
 
-    # Create host pool for draft with the same slot count as the target host pool,
-    # so that host indices stay 1-to-1 between target and draft KV caches.
+    # Keep the existing single-draft fallback for non-Unified caches.
     primary = tree_cache.cache_controller.mem_pool_host
     kw = dict(
         host_to_device_ratio=primary.size / pool.size,
