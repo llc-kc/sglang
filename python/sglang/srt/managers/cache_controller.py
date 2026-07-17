@@ -937,14 +937,12 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(
             op.host_indices, op.device_indices
         )
-        for i in range(self.layer_num):
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                i,
-                self.io_backend,
-            )
+        self.mem_pool_host.load_to_device_all_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            self.io_backend,
+        )
         if host_indices.is_cuda:
             host_indices.record_stream(self.load_stream)
         if device_indices.is_cuda:

@@ -5,6 +5,7 @@ import torch
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_direct_pf_lf,
     transfer_kv_all_layer_lf_ph,
     transfer_kv_all_layer_mla,
     transfer_kv_direct,
@@ -452,25 +453,25 @@ def test_transfer_kv_pf_direct(
             torch.cuda.synchronize()
 
             with torch.cuda.stream(test_stream):
-                transfer_kv_per_layer_direct_pf_lf(
+                transfer_kv_all_layer_direct_pf_lf(
                     [src_pool],
-                    [dst_pool_direct_ptrs[layer_idx_to_test]],
+                    dst_pool_direct_ptrs,
                     src_indices_host,
                     dst_indices_host,
-                    layer_idx_to_test,
                     page_size,
                 )
             test_stream.synchronize()
 
-            ref_copy_with_indices_pf_direct(
-                src_pool,
-                dst_pool_ref,
-                src_indices_host,
-                dst_indices_device,
-                page_size,
-                layer_idx_to_test,
-                lf_to_pf=False,
-            )
+            for layer_id in range(num_layers):
+                ref_copy_with_indices_pf_direct(
+                    src_pool,
+                    dst_pool_ref,
+                    src_indices_host,
+                    dst_indices_device,
+                    page_size,
+                    layer_id,
+                    lf_to_pf=False,
+                )
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
         else:

@@ -619,15 +619,13 @@ class HybridCacheController(BaseHiCacheController):
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
-        for i in range(self.layer_num):
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                i,
-                self.io_backend,
-                pool_transfers=resolved_pool_transfers,
-            )
+        self.mem_pool_host.load_to_device_all_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            self.io_backend,
+            pool_transfers=resolved_pool_transfers,
+        )
         self._record_transfer_indices_on_stream(
             self.load_stream,
             host_indices,

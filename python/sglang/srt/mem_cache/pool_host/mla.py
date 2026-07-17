@@ -39,6 +39,7 @@ _is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_direct_pf_lf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
@@ -382,6 +383,29 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """Load page-first-direct MLA KV with one batched all-layer transfer."""
+        assert not self._is_dummy, "load on a dummy (non-rank-0 MLA) host pool"
+        if (
+            self._is_device_layer_sharded(device_pool)
+            or io_backend != "direct"
+            or self.layout != "page_first_direct"
+        ):
+            super().load_to_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend
+            )
+            return
+
+        transfer_kv_all_layer_direct_pf_lf(
+            src_ptrs=[self.kv_buffer],
+            dst_ptrs=device_pool.kv_buffer,
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+        )
 
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend

@@ -34,6 +34,7 @@ _is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_direct_pf_lf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
@@ -1655,6 +1656,44 @@ class HostPoolGroup:
                 io_backend,
             )
 
+    def load_to_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        pool_transfers: Optional[list] = None,
+    ) -> None:
+        """Load every layer of each participating pool.
+
+        Optimized pools (notably MLA KV) fuse this into an all-layer transfer;
+        other sidecar pools use HostKVCache's per-layer fallback.
+        """
+        anchor = self.anchor_entry
+        if host_indices.numel() > 0:
+            anchor.host_pool.load_to_device_all_layer(
+                anchor.device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+            )
+
+        for transfer in pool_transfers or []:
+            entry = self.entry_map.get(transfer.name)
+            if (
+                entry is None
+                or transfer.host_indices is None
+                or transfer.device_indices is None
+                or transfer.host_indices.numel() == 0
+            ):
+                continue
+            entry.host_pool.load_to_device_all_layer(
+                entry.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                io_backend,
+            )
+
     def backup_from_device_all_layer(
         self,
         device_pool,
@@ -1906,6 +1945,32 @@ class DSAIndexerPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """Load page-first-direct DSA indexers with one batched transfer."""
+        assert not self._is_dummy, "load on a dummy DSA indexer host pool"
+        if (
+            self._is_device_layer_sharded(device_pool)
+            or io_backend != "direct"
+            or self.layout != "page_first_direct"
+        ):
+            super().load_to_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend
+            )
+            return
+
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        transfer_kv_all_layer_direct_pf_lf(
+            src_ptrs=[self.index_k_with_scale_buffer],
+            dst_ptrs=device_pool.index_k_with_scale_buffer,
+            src_indices=host_page_indices,
+            dst_indices=device_page_indices,
+            page_size=1,
+        )
 
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend

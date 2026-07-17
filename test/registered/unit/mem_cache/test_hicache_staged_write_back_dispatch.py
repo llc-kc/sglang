@@ -369,6 +369,88 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 torch.equal(host.kv_buffer[host_indices, layer_id], expected[layer_id])
             )
 
+    def test_mla_all_layer_load_fuses_page_first_direct_only(self):
+        host_indices = _indices(0, 4)
+        device_indices = _indices(4, 8)
+        device_layers = [object(), object()]
+        device_pool = _device_pool_stub(
+            layer_num=len(device_layers),
+            kv_buffer=device_layers,
+        )
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host._is_dummy = False
+        host.layout = "page_first_direct"
+        host.page_size = 2
+        host.kv_buffer = object()
+
+        with mock.patch(
+            f"{MLA_POOL_HOST_MODULE}.transfer_kv_all_layer_direct_pf_lf",
+            create=True,
+        ) as transfer:
+            host.load_to_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="direct",
+            )
+
+        transfer.assert_called_once_with(
+            src_ptrs=[host.kv_buffer],
+            dst_ptrs=device_layers,
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            page_size=host.page_size,
+        )
+
+        host.layout = "layer_first"
+        host.load_to_device_per_layer = mock.Mock()
+        with mock.patch(
+            f"{MLA_POOL_HOST_MODULE}.transfer_kv_all_layer_direct_pf_lf",
+            create=True,
+        ) as transfer:
+            host.load_to_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="direct",
+            )
+
+        transfer.assert_not_called()
+        self.assertEqual(host.load_to_device_per_layer.call_count, len(device_layers))
+
+    def test_dsa_indexer_all_layer_load_fuses_page_first_direct(self):
+        host_indices = _indices(0, 4)
+        device_indices = _indices(4, 8)
+        device_layers = [object(), object()]
+        device_pool = _device_pool_stub(
+            layer_num=len(device_layers),
+            index_k_with_scale_buffer=device_layers,
+        )
+        host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+        host._is_dummy = False
+        host.layout = "page_first_direct"
+        host.page_size = 2
+        host.index_k_with_scale_buffer = object()
+
+        with mock.patch(
+            f"{MEMORY_POOL_HOST_MODULE}.transfer_kv_all_layer_direct_pf_lf",
+            create=True,
+        ) as transfer:
+            host.load_to_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="direct",
+            )
+
+        transfer.assert_called_once()
+        call = transfer.call_args.kwargs
+        self.assertEqual(call["src_ptrs"], [host.index_k_with_scale_buffer])
+        self.assertEqual(call["dst_ptrs"], device_layers)
+        self.assertEqual(call["page_size"], 1)
+        self.assertTrue(torch.equal(call["src_indices"], torch.tensor([0, 1])))
+        self.assertTrue(torch.equal(call["dst_indices"], torch.tensor([2, 3])))
+
     @unittest.skip(
         "TODO: Mamba pool is currently incompatible with write-back staging "
         "kernel; re-enable once the staging bug is fixed."
@@ -726,6 +808,64 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.move_hybrid_indices.assert_not_called()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
         self.assertEqual(captured["pool_transfers"][0].host_indices.device.type, "cpu")
+
+    def test_cache_controller_mla_src_load_uses_all_layer_transfer(self):
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_device = object()
+        controller.mem_pool_host = mock.Mock()
+        controller.io_backend = "direct"
+        controller.load_stream = object()
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        controller._load_mla_on_src_rank(op)
+
+        controller.mem_pool_host.load_to_device_all_layer.assert_called_once_with(
+            controller.mem_pool_device,
+            op.host_indices,
+            op.device_indices,
+            "direct",
+        )
+        controller.mem_pool_host.load_to_device_per_layer.assert_not_called()
+
+    def test_hybrid_controller_mla_src_load_forwards_pool_transfers(self):
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_device = object()
+        controller.mem_pool_host = mock.Mock()
+        controller.io_backend = "direct"
+        controller.load_stream = object()
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, [transfer])
+        )
+        controller._record_transfer_indices_on_stream = mock.Mock()
+
+        controller._load_mla_on_src_rank(op)
+
+        controller.mem_pool_host.load_to_device_all_layer.assert_called_once_with(
+            controller.mem_pool_device,
+            op.host_indices,
+            op.device_indices,
+            "direct",
+            pool_transfers=[transfer],
+        )
+        controller.mem_pool_host.load_to_device_per_layer.assert_not_called()
 
     def test_hybrid_write_moves_indices_without_write_back_jit(self):
         captured = {}

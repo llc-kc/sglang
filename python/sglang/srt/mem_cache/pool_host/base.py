@@ -216,6 +216,23 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        """Load all locally owned KV layers from host to device.
+
+        Pool implementations may override this with a fused all-layer transfer.
+        The default keeps existing pools functional by dispatching per layer.
+        """
+        for layer_id in self._owned_device_layer_ids(device_pool):
+            self.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            )
+
     @abc.abstractmethod
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
