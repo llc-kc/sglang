@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional, Sequence
 
 import torch
 
@@ -83,9 +83,12 @@ def is_mla_dedup_dummy_rank(
 
 
 class MLAHostDedupBroadcaster:
-    """Broadcasts host-loaded MLA KV (and DSA indexer) device pages from the
-    src rank to its attn-TP peers, over a dedicated NCCL group, coalescing
-    all layers of one token chunk into a reused staging buffer."""
+    """Replicates host-loaded MLA KV (and DSA indexer) device pages from the
+    src rank to its attention-TP peers.
+
+    Same-node groups use CUDA IPC direct-push; unsupported configurations fall
+    back to a dedicated NCCL group with a reused staging buffer.
+    """
 
     # Tokens (or DSA indexer pages) staged per broadcast chunk.
     CHUNK_TOKENS = 512
@@ -94,12 +97,18 @@ class MLAHostDedupBroadcaster:
         self,
         device_pool: MLATokenToKVPool,
         group: torch.distributed.ProcessGroup,
+        cpu_group: torch.distributed.ProcessGroup,
+        group_ranks: Sequence[int],
         src_global_rank: int,
     ):
         self.device_pool = device_pool
         self.group = group
+        self.cpu_group = cpu_group
+        self.group_ranks = list(group_ranks)
         self.src_global_rank = src_global_rank
         self.is_src = mla_dedup_rank_and_size()[0] == 0
+        self.rank = torch.distributed.get_rank(group=cpu_group)
+        self.world_size = torch.distributed.get_world_size(group=cpu_group)
         self.layer_num = device_pool.layer_num
         self.device = device_pool.device
         self.kv_staging = torch.empty(
@@ -120,6 +129,20 @@ class MLAHostDedupBroadcaster:
                 device=self.device,
             )
 
+        # Direct-push sends only target indices and a completion token through
+        # NCCL. The KV/indexer payload is written from group rank 0 straight to
+        # peer cache buffers through CUDA IPC mappings.
+        self.direct_push_enabled = False
+        self.kv_direct_push = None
+        self.idx_direct_push = None
+        self.direct_indices = torch.empty(
+            self.world_size * self.CHUNK_TOKENS,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.direct_done = torch.zeros(1, dtype=torch.uint8, device=self.device)
+        self._try_init_direct_push()
+
     @classmethod
     def build(
         cls,
@@ -138,7 +161,150 @@ class MLAHostDedupBroadcaster:
         group = create_custom_parallel_group(
             group_ranks=list(group_ranks), backend="nccl"
         )
-        return cls(device_pool, group, src_global_rank=group_ranks[0])
+        return cls(
+            device_pool,
+            group,
+            cpu_group=base_group,
+            group_ranks=group_ranks,
+            src_global_rank=group_ranks[0],
+        )
+
+    @staticmethod
+    def _buffer_signature(buffers: Sequence[torch.Tensor]) -> tuple:
+        return tuple(
+            (tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype))
+            for tensor in buffers
+        )
+
+    def _gather_objects(self, value: Any) -> List[Any]:
+        """Gloo-compatible object all-gather that also works in inference mode."""
+        gathered = []
+        for group_rank, global_rank in enumerate(self.group_ranks):
+            holder = [value if self.rank == group_rank else None]
+            torch.distributed.broadcast_object_list(
+                holder, src=global_rank, group=self.cpu_group
+            )
+            gathered.append(holder[0])
+        return gathered
+
+    def _broadcast_src_object(self, value: Any) -> Any:
+        holder = [value if self.is_src else None]
+        torch.distributed.broadcast_object_list(
+            holder, src=self.src_global_rank, group=self.cpu_group
+        )
+        return holder[0]
+
+    def _close_direct_push(self) -> None:
+        for state_name in ("kv_direct_push", "idx_direct_push"):
+            state = getattr(self, state_name, None)
+            if state is not None:
+                try:
+                    state.close()
+                except Exception:
+                    pass
+                setattr(self, state_name, None)
+        self.direct_push_enabled = False
+
+    def _try_init_direct_push(self) -> None:
+        """Collectively initialize same-node CUDA IPC mappings.
+
+        Any rank-local setup failure is shared over the CPU group so every rank
+        selects the NCCL fallback consistently.
+        """
+        from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+        if not all(in_the_same_node_as(self.cpu_group, source_rank=0)):
+            if self.is_src:
+                logger.info("MLA CUDA IPC direct-push disabled: TP group spans nodes")
+            return
+
+        local_states = []
+        local_payload = None
+        try:
+            from sglang.jit_kernel.cuda_ipc_direct_push import CudaIpcDirectPush
+
+            kv_state = CudaIpcDirectPush(
+                self.rank, self.world_size, self.device_pool.kv_buffer
+            )
+            local_states.append(kv_state)
+            idx_state = None
+            if self.idx_bufs is not None:
+                idx_state = CudaIpcDirectPush(self.rank, self.world_size, self.idx_bufs)
+                local_states.append(idx_state)
+            local_payload = {
+                "ok": True,
+                "kv": kv_state.share_buffers(),
+                "kv_signature": self._buffer_signature(self.device_pool.kv_buffer),
+                "idx": None if idx_state is None else idx_state.share_buffers(),
+                "idx_signature": (
+                    None
+                    if self.idx_bufs is None
+                    else self._buffer_signature(self.idx_bufs)
+                ),
+            }
+        except Exception as exc:
+            local_payload = {"ok": False, "error": repr(exc)}
+
+        peer_payloads = self._gather_objects(local_payload)
+        signatures_match = all(
+            payload.get("ok")
+            and payload.get("kv_signature") == peer_payloads[0].get("kv_signature")
+            and payload.get("idx_signature") == peer_payloads[0].get("idx_signature")
+            for payload in peer_payloads
+        )
+        if not signatures_match:
+            errors = [
+                payload.get("error", "buffer signature mismatch")
+                for payload in peer_payloads
+                if not payload.get("ok")
+                or payload.get("kv_signature") != peer_payloads[0].get("kv_signature")
+                or payload.get("idx_signature") != peer_payloads[0].get("idx_signature")
+            ]
+            for state in local_states:
+                state.close()
+            if self.is_src:
+                logger.warning(
+                    "MLA CUDA IPC direct-push unavailable; using NCCL fallback: %s",
+                    "; ".join(errors),
+                )
+            return
+
+        open_status = None
+        if self.is_src:
+            try:
+                kv_state.open_peer_buffers([payload["kv"] for payload in peer_payloads])
+                if idx_state is not None:
+                    idx_state.open_peer_buffers(
+                        [payload["idx"] for payload in peer_payloads]
+                    )
+                open_status = {"ok": True}
+            except Exception as exc:
+                open_status = {"ok": False, "error": repr(exc)}
+        open_status = self._broadcast_src_object(open_status)
+        if not open_status["ok"]:
+            for state in local_states:
+                state.close()
+            if self.is_src:
+                logger.warning(
+                    "MLA CUDA IPC peer mapping failed; using NCCL fallback: %s",
+                    open_status["error"],
+                )
+            return
+
+        if self.is_src:
+            self.kv_direct_push = kv_state
+            self.idx_direct_push = idx_state
+        else:
+            # Exported handles remain valid for the lifetime of their cache
+            # tensors; non-source ranks do not need to retain a control object.
+            for state in local_states:
+                state.close()
+        self.direct_push_enabled = True
+        if self.is_src:
+            logger.info(
+                "MLA CUDA IPC direct-push enabled for %d local TP ranks",
+                self.world_size,
+            )
 
     def broadcast_loaded(self, device_indices: torch.Tensor, load_stream) -> None:
         """Broadcast loaded pages from the src rank. Must run with
@@ -153,6 +319,7 @@ class MLAHostDedupBroadcaster:
             self.kv_staging,
             indices,
             self.device_pool.kv_cache_dim,
+            self.kv_direct_push,
         )
         # to do: support indexer sharing across layers
         if self.idx_bufs is not None:
@@ -164,11 +331,21 @@ class MLAHostDedupBroadcaster:
             )
             if page_idx.is_cuda:
                 page_idx.record_stream(load_stream)
-            self._bcast_rows(self.idx_bufs, self.idx_staging, page_idx, self.idx_elem)
+            self._bcast_rows(
+                self.idx_bufs,
+                self.idx_staging,
+                page_idx,
+                self.idx_elem,
+                self.idx_direct_push,
+            )
 
-    def _bcast_rows(self, buf_list, staging, target, elem) -> None:
+    def _bcast_rows(self, buf_list, staging, target, elem, direct_push) -> None:
         """Chunked broadcast of one per-layer buffer set; ``target`` indexes
         dim 0 (token indices for KV, page indices for the DSA indexer)."""
+        if self.direct_push_enabled:
+            self._direct_push_rows(target, direct_push)
+            return
+
         n = target.shape[0]
         for start in range(0, n, self.CHUNK_TOKENS):
             cur = min(self.CHUNK_TOKENS, n - start)
@@ -184,11 +361,37 @@ class MLAHostDedupBroadcaster:
             if not self.is_src:
                 for layer_id in range(self.layer_num):
                     o = layer_id * cur * elem
-                    buf_list[layer_id][idx] = chunk[o : o + cur * elem].view(
-                        buf_list[layer_id][idx].shape
-                    )
+                    dst = buf_list[layer_id]
+                    dst[idx] = chunk[o : o + cur * elem].view(cur, *dst.shape[1:])
+
+    def _direct_push_rows(self, target, direct_push) -> None:
+        n = target.shape[0]
+        if target.dtype != torch.int64:
+            target = target.to(dtype=torch.int64)
+        for start in range(0, n, self.CHUNK_TOKENS):
+            cur = min(self.CHUNK_TOKENS, n - start)
+            local_indices = target[start : start + cur].contiguous()
+            indices_per_rank = self.direct_indices[: self.world_size * cur].view(
+                self.world_size, cur
+            )
+            torch.distributed.all_gather_into_tensor(
+                indices_per_rank.reshape(-1),
+                local_indices,
+                group=self.group,
+            )
+            if self.is_src:
+                assert direct_push is not None
+                direct_push.push(indices_per_rank)
+            # A one-byte collective orders the source's remote writes before
+            # peer load streams publish their per-layer completion events.
+            torch.distributed.broadcast(
+                self.direct_done,
+                src=self.src_global_rank,
+                group=self.group,
+            )
 
     def destroy(self) -> None:
+        self._close_direct_push()
         if self.group is None:
             return
         try:
