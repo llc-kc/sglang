@@ -576,6 +576,47 @@ class HybridCacheController(BaseHiCacheController):
         )
         return device_indices
 
+    def _prepare_mla_source_load(self, op: CacheOperation):
+        """Resolve target and extra-pool indices once for layerwise H2D."""
+        return self.move_hybrid_indices(op)
+
+    def _load_mla_source_layer(self, source_state, layer_id: int) -> None:
+        """Load one target layer and its corresponding extra-pool data."""
+        host_indices, device_indices, resolved_pool_transfers = source_state
+        self.mem_pool_host.load_to_device_per_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            layer_id,
+            self.io_backend,
+            pool_transfers=resolved_pool_transfers,
+        )
+
+    def _record_mla_source_load(self, source_state) -> None:
+        host_indices, device_indices, resolved_pool_transfers = source_state
+        self._record_transfer_indices_on_stream(
+            self.l2_transfer_engine.host_to_device_stream,
+            host_indices,
+            device_indices,
+            resolved_pool_transfers,
+        )
+
+    def _record_transfer_indices_on_stream(
+        self,
+        stream: torch.Stream,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> None:
+        if host_indices.is_cuda:
+            host_indices.record_stream(stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(stream)
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                transfer.host_indices.record_stream(stream)
+            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
+                transfer.device_indices.record_stream(stream)
     def prefetch(
         self,
         request_id: str,
