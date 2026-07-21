@@ -278,6 +278,7 @@ class HiCacheController:
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self.draft_backup_skip = False
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -492,13 +493,6 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
-        if self.mla_broadcast_enabled and self.has_draft:
-            raise RuntimeError(
-                "Cannot attach HiCache L3 storage while MLA host-memory dedup "
-                "and a local draft L2 cache are both active. Draft L3 needs "
-                "per-rank storage keys and is not implemented."
-            )
-
         # While dedup is active, non-src ranks hold buffer-less dummy host
         # pools that RDMA/registered backends would dereference. Reject on
         # EVERY rank: attach is fanned out with no rollback on partial
@@ -512,7 +506,7 @@ class HiCacheController:
                 f"{storage_backend!r} while MLA/NSA host-memory dedup is "
                 f"active: non-rank-0 attn-TP ranks hold dummy host pools "
                 f"(kv_buffer=None) and this backend would dereference them. "
-                f"Only None/''/'file' backends can attach later in dedup "
+                f"Only None/''/'file'/'mooncake' backends can attach later in dedup "
                 f"mode. Restart the server with "
                 f"--hicache-storage-backend={storage_backend} to use this "
                 f"backend (every rank will then keep a full host pool)."
@@ -536,6 +530,7 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
+        self._refresh_draft_backup_skip()
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
@@ -550,14 +545,10 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
-            # Dummy host pool: no buffer to register; this rank never reads L3.
-            if getattr(self.mem_pool_host, "_is_dummy", False):
-                logger.info(
-                    "Skipping register_mem_pool_host on dummy (non-rank-0 dedup) "
-                    "host pool with no KV buffer."
-                )
-            else:
-                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            # Registration also binds the logical anchor object. Mooncake's
+            # implementation detects kv_buffer=None and skips buffer pinning,
+            # while retaining the anchor for v1/v2 logical-target semantics.
+            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -989,28 +980,15 @@ class HiCacheController:
                 # therefore makes this layer visible to the forward stream while
                 # later layers continue loading.
                 broadcast_start = self._mla_trace_event(trace)
-                if trace is None:
-                    self.mla_broadcaster.broadcast_loaded_layer(i, broadcast_plan)
-                else:
-                    self.mla_broadcaster.broadcast_loaded_layer(
-                        i, broadcast_plan, trace=trace
-                    )
+                self.mla_broadcaster.broadcast_loaded_layer(
+                    i, broadcast_plan, trace=trace
+                )
                 self._finish_mla_trace_phase(trace, "broadcast_total", broadcast_start)
                 if draft_state is not None:
                     draft_start = self._mla_trace_event(trace)
                     self._load_draft_layer(draft_state, i)
                     self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
 
-                # A draft can theoretically contain more layers than the target.
-                # Preserve the previous dedup path's all-draft completion guarantee
-                # by placing any tail before the final target-layer event.
-                if i == self.layer_num - 1 and draft_state is not None:
-                    for draft_layer_id in range(
-                        self.layer_num, self.mem_pool_host_draft.layer_num
-                    ):
-                        draft_start = self._mla_trace_event(trace)
-                        self._load_draft_layer(draft_state, draft_layer_id)
-                        self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
                 producer_event.complete(i)
                 if trace is not None:
                     layer_ready = device_module.Event(enable_timing=True)
@@ -1210,25 +1188,34 @@ class HiCacheController:
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
         """Register a full local draft KV pool for HiCache L2 transfers."""
-        if self.mla_broadcast_enabled and self.enable_storage:
-            raise NotImplementedError(
-                "Draft HiCache L3 storage is not supported together with MLA "
-                "host-memory dedup. Draft L2 host cache is supported, but L3 "
-                "needs per-rank draft storage keys."
-            )
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
+        self._set_draft_backup_skip(draft_device_pool)
         logger.info(
             "HiCache draft KV registered: %s (host %d slots)",
             type(draft_device_pool).__name__,
             draft_host_pool.size,
         )
 
-        # L3 is rejected above for MLA dedup because draft shards need a
-        # rank-qualified storage key. The normal non-dedup path can still
-        # register its existing draft L3 I/O here.
         self._maybe_register_draft_with_storage()
+
+    def _set_draft_backup_skip(self, draft_device_pool) -> None:
+        """Skip replicated MLA/DSA draft L3 writes on non-zero TP ranks.
+
+        This does not affect L2: every rank still owns and transfers its full
+        draft host pool independently.
+        """
+        storage_config = getattr(self, "storage_config", None)
+        self.draft_backup_skip = (
+            isinstance(draft_device_pool, MLATokenToKVPool)
+            and storage_config is not None
+            and storage_config.tp_rank != 0
+        )
+
+    def _refresh_draft_backup_skip(self) -> None:
+        if self.has_draft:
+            self._set_draft_backup_skip(self.mem_pool_device_draft)
 
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""
@@ -1334,11 +1321,6 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
-        # Dummy host pool: only the src rank reads L3; mark complete so the
-        # MIN-synced cross-rank accounting stays consistent.
-        if self._mla_skip_host_io:
-            operation.completed_tokens += len(operation.hash_value) * self.page_size
-            return
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1354,9 +1336,16 @@ class HiCacheController:
                 self._draft_page_get(batch_hashes, batch_host_indices)
 
             prev_completed_tokens = operation.completed_tokens
-            # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            if not self._mla_skip_host_io:
+                # Get one batch token, and update the completed_tokens if succeed
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                self.page_get_func(
+                    operation, batch_hashes, batch_host_indices, extra_info
+                )
+            else:
+                # The source rank owns target L2/L3. Keep cross-rank progress
+                # aligned after this rank has restored its local draft state.
+                operation.completed_tokens += len(batch_hashes) * self.page_size
             # Check termination
             if (
                 operation.completed_tokens
@@ -1569,7 +1558,11 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = True
+            if not self._mla_skip_host_io:
+                success = self.page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
+                )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
@@ -1577,7 +1570,7 @@ class HiCacheController:
                 break
 
             # Best-effort draft L3 write alongside target.
-            if self.has_draft:
+            if self.has_draft and not self.draft_backup_skip:
                 self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
@@ -1594,7 +1587,7 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
+                if not (self._mla_skip_host_io and self.draft_backup_skip):
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 

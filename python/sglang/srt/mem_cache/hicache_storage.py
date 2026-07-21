@@ -80,6 +80,26 @@ class PoolName(str, Enum):
         return self.value
 
 
+RANK_LOCAL_DRAFT_POOLS = frozenset(
+    {
+        PoolName.DRAFT,
+        PoolName.DRAFT_INDEXER,
+        PoolName.DRAFT_SWA,
+    }
+)
+
+
+def is_rank_local_draft_pool(pool_name: PoolName) -> bool:
+    """Whether a HiCache pool contains TP-rank-local speculative state.
+
+    Target MLA/DSA state is replicated across attention-TP ranks and may be
+    deduplicated. Draft state is sharded by the draft model, even when its
+    concrete host-pool class happens to be MLA-shaped, so it must keep
+    independent L2 reads and writes on every rank.
+    """
+    return pool_name in RANK_LOCAL_DRAFT_POOLS
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
