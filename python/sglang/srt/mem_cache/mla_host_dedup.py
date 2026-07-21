@@ -34,10 +34,8 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-# Backends that never touch the host KV buffer directly, so they tolerate
-# the buffer-less dummy pools. RDMA/registered backends (mooncake/eic/simm/
-# hf3fs/nixl/aibrix) pin or register the buffer — dedup stays off for them.
-_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
+# tested L3 backends
+_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file", "mooncake"})
 
 
 def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
@@ -94,7 +92,7 @@ class MLAHostDedupBroadcaster:
     """
 
     # Tokens (or DSA indexer pages) staged per broadcast chunk.
-    CHUNK_TOKENS = 512
+    CHUNK_TOKENS = 2048
 
     def __init__(
         self,
