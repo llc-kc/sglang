@@ -1005,6 +1005,9 @@ class HiCacheController:
                 trace["cpu_submit_end"] = time.perf_counter()
                 self._mla_trace_pending.append(trace)
 
+        # avoid deadlock among GPU ranks since some GPU will do forward earlier
+        self.load_stream.synchronize()
+
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=ack_start_event,
