@@ -178,6 +178,17 @@ class _FakeEvent:
         pass
 
 
+class _FakeStream:
+    def __init__(self, operations=None):
+        self.operations = operations
+        self.synchronize_count = 0
+
+    def synchronize(self):
+        self.synchronize_count += 1
+        if self.operations is not None:
+            self.operations.append(("synchronize", None))
+
+
 class _FakeDeviceModule:
     Event = _FakeEvent
 
@@ -1207,7 +1218,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 (layer_id, prepared)
             ),
         )
-        controller.load_stream = object()
+        controller.load_stream = _FakeStream()
         controller.ack_load_queue = []
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
@@ -1221,6 +1232,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual([layer_id for layer_id, _ in broadcasts], [0, 1, 2])
         self.assertEqual(len(draft_loads), 2)
         self.assertEqual(producer_event.completed_layers, [0, 1, 2])
+        self.assertEqual(controller.load_stream.synchronize_count, 1)
         self.assertEqual(len(controller.ack_load_queue), 1)
         ack = controller.ack_load_queue[0]
         self.assertEqual(ack.num_tokens, 4)
@@ -1288,7 +1300,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 ("broadcast", layer_id)
             ),
         )
-        controller.load_stream = object()
+        controller.load_stream = _FakeStream(operations)
         controller.ack_load_queue = []
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
@@ -1314,6 +1326,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 ("target", 2),
                 ("broadcast", 2),
                 ("complete", 2),
+                ("synchronize", None),
             ],
         )
 
@@ -1442,7 +1455,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 ("broadcast", layer_id)
             ),
         )
-        controller.load_stream = object()
+        controller.load_stream = _FakeStream(operations)
         controller.ack_load_queue = []
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, pool_transfers)
@@ -1468,6 +1481,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 ("load", 1, pool_transfers),
                 ("broadcast", 1),
                 ("complete", 1),
+                ("synchronize", None),
             ],
         )
         controller._record_transfer_indices_on_stream.assert_called_once_with(

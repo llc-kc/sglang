@@ -1025,6 +1025,12 @@ class HiCacheController:
                 trace["cpu_submit_end"] = time.perf_counter()
                 self._mla_trace_pending.append(trace)
 
+        # Peer ranks skip the source H2D copies and can otherwise return to
+        # model-TP collectives while later dedup broadcasts are still pending
+        # on a separate NCCL communicator. Drain the dedup load stream on every
+        # rank before forward resumes to avoid a cross-communicator deadlock.
+        self.load_stream.synchronize()
+
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=ack_start_event,
