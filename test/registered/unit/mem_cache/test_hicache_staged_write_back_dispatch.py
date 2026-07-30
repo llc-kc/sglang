@@ -182,6 +182,14 @@ class _FakeStream:
     def __init__(self, operations=None):
         self.operations = operations
         self.synchronize_count = 0
+        self.waited_streams = []
+        self.waited_events = []
+
+    def wait_stream(self, stream):
+        self.waited_streams.append(stream)
+
+    def wait_event(self, event):
+        self.waited_events.append(event)
 
     def synchronize(self):
         self.synchronize_count += 1
@@ -1358,6 +1366,79 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         with mock.patch.object(torch.distributed, "broadcast"):
             broadcaster._bcast_layer(received, staging, target, 4, layer_id=1)
         torch.testing.assert_close(received[1].index_select(0, target), expected)
+
+    def test_mla_dedup_indexer_pages_preserve_logical_order(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.device = torch.device("cpu")
+        broadcaster.device_pool = SimpleNamespace(page_size=4)
+        broadcaster.idx_bufs = [object()]
+
+        # Logical page 0 is backed by physical page 2, while logical page 1 is
+        # backed by physical page 0. unique() would sort this to [0, 2] and
+        # swap the payload when another TP rank uses different physical pages.
+        device_indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3], dtype=torch.int64)
+        prepared_indices, page_indices = broadcaster.prepare_broadcast(
+            device_indices, _FakeStream()
+        )
+
+        self.assertIs(prepared_indices, device_indices)
+        torch.testing.assert_close(page_indices, torch.tensor([2, 0]))
+
+    def test_mla_dedup_indexer_rejects_partial_pages(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.device = torch.device("cpu")
+        broadcaster.device_pool = SimpleNamespace(page_size=4)
+        broadcaster.idx_bufs = [object()]
+
+        with self.assertRaisesRegex(ValueError, "page-aligned device indices"):
+            broadcaster.prepare_broadcast(torch.arange(7), _FakeStream())
+
+    def test_hicache_write_fences_forward_stream_both_directions(self):
+        class FakeHostPool:
+            layout = "layer_first"
+            can_use_write_back_jit = False
+
+            def backup_from_device_all_layer(self, *args):
+                pass
+
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        producer_stream = object()
+        write_stream = _FakeStream()
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller.mem_pool_host = FakeHostPool()
+        controller.mem_pool_device = object()
+        controller.has_draft = False
+        controller.mla_broadcaster = None
+        controller.producer_stream = producer_stream
+        controller.last_write_finish_event = None
+        controller.write_stream = write_stream
+        controller.ack_write_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_writing()
+
+        self.assertEqual(write_stream.waited_streams, [producer_stream])
+        self.assertIs(
+            controller.last_write_finish_event,
+            controller.ack_write_queue[0].finish_event,
+        )
+        forward_stream = _FakeStream()
+        controller.wait_for_last_write(forward_stream)
+        self.assertEqual(
+            forward_stream.waited_events,
+            [controller.ack_write_queue[0].finish_event],
+        )
 
     def test_hybrid_mla_dedup_peer_still_writes_local_draft_pool(self):
         target_writes = []

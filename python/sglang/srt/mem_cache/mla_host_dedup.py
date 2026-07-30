@@ -159,11 +159,21 @@ class MLAHostDedupBroadcaster:
         page_idx = None
         if self.idx_bufs is not None:
             page_size = self.device_pool.page_size
-            page_idx = (
-                torch.unique(torch.div(indices, page_size, rounding_mode="floor"))
-                if page_size > 1
-                else indices
-            )
+            if page_size > 1:
+                if indices.numel() % page_size != 0:
+                    raise ValueError(
+                        "DSA dedup broadcast expects page-aligned device indices: "
+                        f"got {indices.numel()} indices for page_size={page_size}."
+                    )
+                # `indices` is ordered by logical cache position, while every
+                # attention-TP rank can allocate different physical pages.
+                # Keep one physical page id per logical page *in that order*.
+                # torch.unique() sorts by local physical id, which destroys the
+                # source-to-peer page correspondence and can also make collective
+                # payload sizes rank-dependent when physical pages repeat.
+                page_idx = indices[::page_size] // page_size
+            else:
+                page_idx = indices
             if page_idx.is_cuda:
                 page_idx.record_stream(load_stream)
         return indices, page_idx

@@ -332,6 +332,11 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        # In overlap mode, model forward writes KV on a separate stream while
+        # HiCache reads it back on the L2 engine stream. These dependencies
+        # protect both directions without a device-wide synchronize.
+        self.producer_stream = None
+        self.last_write_finish_event = None
 
         # MLA/DSA host-memory dedup (see mla_host_dedup): consume the groups
         # the caller prebuilt before the slow host KV alloc, else build
@@ -368,6 +373,16 @@ class HiCacheController:
     @property
     def mla_broadcast_enabled(self) -> bool:
         return self.mla_broadcaster is not None
+
+    def set_producer_stream(self, stream) -> None:
+        """Register the model-forward stream that produces device KV."""
+        self.producer_stream = stream
+
+    def wait_for_last_write(self, stream) -> None:
+        """Fence a consumer stream behind the latest enqueued D2H write."""
+        finish_event = self.last_write_finish_event
+        if finish_event is not None:
+            stream.wait_event(finish_event)
 
     @property
     def _mla_skip_host_io(self) -> bool:
@@ -802,10 +817,16 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
+        producer_stream = getattr(self, "producer_stream", None)
+        if producer_stream is not None:
+            self.l2_transfer_engine.device_to_host_stream.wait_stream(producer_stream)
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
+        # The next model forward must not reuse/write these slots until D2H is
+        # done. Scheduler inserts this event into forward_stream.
+        self.last_write_finish_event = completion.finish_event
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
