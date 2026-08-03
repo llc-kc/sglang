@@ -133,8 +133,15 @@ class MLAHostDedupBroadcaster:
         tp_group: torch.distributed.ProcessGroup,
         attn_tp_group: Optional[torch.distributed.ProcessGroup],
     ) -> MLAHostDedupBroadcaster:
-        """Build the NCCL group (a world collective — all dedup participants
-        must call in lockstep) and the staging buffers."""
+        """Build and eagerly initialize the dedicated NCCL broadcast group.
+
+        Group construction alone does not initialize ProcessGroupNCCL's CUDA
+        resources.  Without a collective here, the first host-cache hit can
+        lazily allocate those resources while a large prefill has consumed the
+        remaining device-memory headroom.  All dedup participants already call
+        this method in lockstep, before the slow host-pool allocation, so this
+        is the safe point to force communicator initialization.
+        """
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         base_group = tp_group
@@ -144,7 +151,23 @@ class MLAHostDedupBroadcaster:
         group = create_custom_parallel_group(
             group_ranks=list(group_ranks), backend="nccl"
         )
-        return cls(device_pool, group, src_global_rank=group_ranks[0])
+        broadcaster = cls(device_pool, group, src_global_rank=group_ranks[0])
+        broadcaster._warmup_group()
+        return broadcaster
+
+    def _warmup_group(self) -> None:
+        """Force the dedicated NCCL communicator to allocate before serving."""
+        # Reuse the staging allocation so warmup itself needs no extra device
+        # buffer.  Only the source value matters; peers receive it in place.
+        warmup = self.kv_staging[:1]
+        if self.is_src:
+            warmup.zero_()
+        torch.distributed.broadcast(warmup, src=self.src_global_rank, group=self.group)
+        # NCCL collectives are enqueued asynchronously on the current stream.
+        # Complete this startup-only operation now so initialization failures
+        # surface here rather than during a request's host-cache load.
+        torch.cuda.synchronize(self.device)
+        logger.info("MLA host-dedup NCCL broadcast group warmup completed")
 
     def prepare_broadcast(
         self, device_indices: torch.Tensor, load_stream
