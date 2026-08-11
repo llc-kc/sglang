@@ -1140,6 +1140,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         class FakeTargetHostPool:
             layout = "page_first"
             can_use_write_back_jit = False
+            size_per_token = 1
 
             def backup_from_device_all_layer(self, *args):
                 target_writes.append(args)
@@ -1147,6 +1148,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         class FakeDraftHostPool:
             layout = "page_first"
             can_use_write_back_jit = True
+            size_per_token = 1
 
             def backup_from_device_all_layer(self, *args):
                 draft_writes.append(args)
@@ -1441,6 +1443,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         class FakeHostPool:
             layout = "layer_first"
             can_use_write_back_jit = False
+            size_per_token = 1
 
             def backup_from_device_all_layer(self, *args):
                 pass
@@ -1522,6 +1525,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             return_value=(op.host_indices, op.device_indices, None)
         )
         controller._record_transfer_indices_on_stream = lambda *args: None
+        controller._num_tokens_by_pool = lambda op: {"kv": len(op.device_indices)}
+        controller._transfer_num_bytes = lambda op: 0
 
         with mock.patch.object(
             hybrid_cache_controller, "device_module", _FakeDeviceModule
