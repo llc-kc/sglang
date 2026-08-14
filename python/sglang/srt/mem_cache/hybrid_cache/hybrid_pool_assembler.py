@@ -21,12 +21,12 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
-from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupPrebuild,
     is_mla_dedup_dummy_rank,
     maybe_prebuild_mla_host_dedup,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,

@@ -48,11 +48,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.mla_host_dedup import (
     is_mla_dedup_dummy_rank,
     maybe_prebuild_mla_host_dedup,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (

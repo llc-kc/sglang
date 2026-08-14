@@ -80,6 +80,25 @@ class PoolName(str, Enum):
         return self.value
 
 
+DRAFT_SIDECAR_POOLS = frozenset(
+    {
+        PoolName.DRAFT,
+        PoolName.DRAFT_INDEXER,
+        PoolName.DRAFT_SWA,
+    }
+)
+
+
+def is_draft_sidecar_pool(pool_name: PoolName) -> bool:
+    """Whether a pool is transferred separately from homogeneous MTP KV.
+
+    EAGLE/DSpark draft state uses these sidecars and must still perform local
+    L2 transfers on non-source MLA-dedup ranks. Packed NextN/MTP state is part
+    of the target host page and therefore never appears as a PoolTransfer.
+    """
+    return pool_name in DRAFT_SIDECAR_POOLS
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
