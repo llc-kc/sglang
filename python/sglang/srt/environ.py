@@ -655,6 +655,17 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Base token count used to size each MLA/DSA host-dedup broadcast chunk.
+    # Layerwise broadcast reuses the all-layer staging allocation, so the
+    # effective per-layer capacity is this value multiplied by layer count.
+    SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    # Per-call chunk size (GB) for cudaHostRegister of the host KV pool.
+    # Default 256 stays well under the single-call death zone observed on
+    # NVIDIA L20D / Blackwell + driver 580.105.08, where any cudaHostRegister
+    # past ~500-600GB fails ("NVRM: failed to allocate page table") and
+    # corrupts the CUDA context. Set larger than the total host pool to fall
+    # back to a single call.
+    SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
