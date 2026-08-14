@@ -23,6 +23,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -93,9 +94,6 @@ class MLAHostDedupBroadcaster:
     NCCL call count by ``layer_num`` for large loads.
     """
 
-    # Tokens (or DSA indexer pages) staged per broadcast chunk.
-    CHUNK_TOKENS = 512
-
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
@@ -108,8 +106,14 @@ class MLAHostDedupBroadcaster:
         self.is_src = mla_dedup_rank_and_size()[0] == 0
         self.layer_num = device_pool.layer_num
         self.device = device_pool.device
+        self.chunk_tokens = envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.get()
+        if self.chunk_tokens <= 0:
+            raise ValueError(
+                "SGLANG_MLA_DEDUP_CHUNK_TOKENS must be positive, "
+                f"got {self.chunk_tokens}."
+            )
         self.kv_staging = torch.empty(
-            self.layer_num * self.CHUNK_TOKENS * device_pool.kv_cache_dim,
+            self.layer_num * self.chunk_tokens * device_pool.kv_cache_dim,
             dtype=device_pool.kv_buffer[0].dtype,
             device=self.device,
         )
@@ -121,10 +125,16 @@ class MLAHostDedupBroadcaster:
             self.idx_bufs = device_pool.index_k_with_scale_buffer
             self.idx_elem = math.prod(self.idx_bufs[0].shape[1:]) or 1
             self.idx_staging = torch.empty(
-                self.layer_num * self.CHUNK_TOKENS * self.idx_elem,
+                self.layer_num * self.chunk_tokens * self.idx_elem,
                 dtype=self.idx_bufs[0].dtype,
                 device=self.device,
             )
+        logger.info(
+            "MLA host-dedup broadcast chunk configured: base_tokens=%d, "
+            "effective_layer_tokens=%d",
+            self.chunk_tokens,
+            self.layer_num * self.chunk_tokens,
+        )
 
     @classmethod
     def build(
@@ -242,7 +252,7 @@ class MLAHostDedupBroadcaster:
     ) -> None:
         """Chunked in-place broadcast for one layer.
 
-        ``staging`` is sized for ``layer_num * CHUNK_TOKENS`` rows.  Reusing
+        ``staging`` is sized for ``layer_num * chunk_tokens`` rows. Reusing
         the full allocation for one layer preserves the previous maximum NCCL
         payload size while enabling per-layer completion events.  ``index_select``
         with an output tensor and ``index_copy_`` avoid the temporary tensors

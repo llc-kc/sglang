@@ -656,6 +656,10 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Base token count used to size each MLA/DSA host-dedup broadcast chunk.
+    # Layerwise broadcast reuses the all-layer staging allocation, so the
+    # effective per-layer capacity is this value multiplied by layer count.
+    SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     # Per-call chunk size (GB) for cudaHostRegister of the host KV pool.
     # Default 256 stays well under the single-call death zone observed on
     # NVIDIA L20D / Blackwell + driver 580.105.08, where any cudaHostRegister

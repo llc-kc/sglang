@@ -1367,7 +1367,7 @@ class HiCacheController:
         # Dummy host pool: only the src rank reads L3; mark complete so the
         # MIN-synced cross-rank accounting stays consistent.
         if self._mla_skip_host_io:
-            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            operation.increment(len(operation.hash_value) * self.page_size)
             return
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys

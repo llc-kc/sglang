@@ -713,7 +713,7 @@ class HybridCacheController(BaseHiCacheController):
         # pool_transfers_done lets this rank pass the all-reduced termination
         # check.
         if self._mla_skip_host_io:
-            operation.completed_tokens += len(operation.hash_value) * self.page_size
+            operation.increment(len(operation.hash_value) * self.page_size)
             operation.pool_transfers_done = True
             return
 

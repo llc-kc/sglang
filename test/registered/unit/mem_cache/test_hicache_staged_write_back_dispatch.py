@@ -7,15 +7,20 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.managers import cache_controller as manager_cache_controller
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheOperation
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -1369,6 +1374,63 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             broadcaster._bcast_layer(received, staging, target, 4, layer_id=1)
         torch.testing.assert_close(received[1].index_select(0, target), expected)
 
+    def test_mla_dedup_chunk_tokens_uses_environment(self):
+        device_pool = _device_pool_stub(
+            layer_num=2,
+            device=torch.device("cpu"),
+            kv_cache_dim=4,
+            kv_buffer=[torch.empty(3, 1, 4), torch.empty(3, 1, 4)],
+        )
+
+        with (
+            envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.override(7),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                return_value=(0, 2),
+            ),
+        ):
+            broadcaster = MLAHostDedupBroadcaster(
+                device_pool, group=object(), src_global_rank=0
+            )
+
+        self.assertEqual(broadcaster.chunk_tokens, 7)
+        self.assertEqual(broadcaster.kv_staging.numel(), 2 * 7 * 4)
+
+    def test_mla_dedup_chunk_tokens_must_be_positive(self):
+        device_pool = _device_pool_stub(
+            layer_num=2,
+            device=torch.device("cpu"),
+            kv_cache_dim=4,
+            kv_buffer=[torch.empty(3, 1, 4), torch.empty(3, 1, 4)],
+        )
+
+        with (
+            envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.override(0),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                return_value=(0, 2),
+            ),
+            self.assertRaisesRegex(ValueError, "must be positive"),
+        ):
+            MLAHostDedupBroadcaster(device_pool, group=object(), src_global_rank=0)
+
+    def test_mla_dedup_peer_prefetch_uses_synchronized_increment(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.page_size = 4
+        operation = PrefetchOperation(
+            request_id="request",
+            token_ids=[],
+            pool_transfers=[object()],
+        )
+        operation.hash_value = ["page-0", "page-1"]
+        operation.increment = mock.Mock(return_value=True)
+
+        controller._page_transfer(operation)
+
+        operation.increment.assert_called_once_with(8)
+        self.assertTrue(operation.pool_transfers_done)
+
     def test_mla_dedup_build_eagerly_warms_dedicated_nccl_group(self):
         tp_group = object()
         dedicated_group = object()
@@ -1439,7 +1501,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "page-aligned device indices"):
             broadcaster.prepare_broadcast(torch.arange(7), _FakeStream())
 
-    def test_hicache_write_fences_forward_stream_both_directions(self):
+    def test_mla_dedup_write_fences_forward_stream_both_directions(self):
         class FakeHostPool:
             layout = "layer_first"
             can_use_write_back_jit = False
@@ -1461,7 +1523,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_host = FakeHostPool()
         controller.mem_pool_device = object()
         controller.has_draft = False
-        controller.mla_broadcaster = None
+        controller.mla_broadcaster = SimpleNamespace(is_src=True)
         controller.producer_stream = producer_stream
         controller.last_write_finish_event = None
         controller.write_stream = write_stream
