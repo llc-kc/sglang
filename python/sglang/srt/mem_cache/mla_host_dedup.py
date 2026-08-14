@@ -35,10 +35,8 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-# Backends that never touch the host KV buffer directly, so they tolerate
-# the buffer-less dummy pools. RDMA/registered backends (mooncake/eic/simm/
-# hf3fs/nixl/aibrix) pin or register the buffer — dedup stays off for them.
-_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
+# tested L3 backends
+_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file", "mooncake"})
 
 
 def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
@@ -238,6 +236,39 @@ class MLAHostDedupBroadcaster:
                 layer_id,
                 trace=trace,
                 trace_prefix="indexer",
+            )
+
+    def broadcast_loaded_mtp_draft(
+        self,
+        draft_pool: MLATokenToKVPool,
+        prepared: tuple[torch.Tensor, Optional[torch.Tensor]],
+        trace=None,
+    ) -> None:
+        """Broadcast one loaded homogeneous MTP draft KV layer and its optional DSA indexer layer."""
+        indices, page_idx = prepared
+        assert type(draft_pool) is type(self.device_pool)
+        assert draft_pool.kv_cache_dim == self.device_pool.kv_cache_dim
+        # typically mtp layer has only one layer
+        assert draft_pool.layer_num == 1
+
+        self._bcast_layer(
+            draft_pool.kv_buffer,
+            self.kv_staging,
+            indices,
+            draft_pool.kv_cache_dim,
+            layer_id=0,
+            trace=trace,
+            trace_prefix="mtp_kv",
+        )
+        if self.idx_bufs is not None:
+            self._bcast_layer(
+                draft_pool.index_k_with_scale_buffer,
+                self.idx_staging,
+                page_idx,
+                self.idx_elem,
+                layer_id=0,
+                trace=trace,
+                trace_prefix="mtp_indexer",
             )
 
     def _bcast_layer(

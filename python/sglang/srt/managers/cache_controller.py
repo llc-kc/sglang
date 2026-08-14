@@ -514,13 +514,6 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
-        if self.mla_broadcast_enabled and self.has_draft:
-            raise RuntimeError(
-                "Cannot attach HiCache L3 storage while MLA host-memory dedup "
-                "and a local draft L2 cache are both active. Draft L3 needs "
-                "per-rank storage keys and is not implemented."
-            )
-
         # While dedup is active, non-src ranks hold buffer-less dummy host
         # pools that RDMA/registered backends would dereference. Reject on
         # EVERY rank: attach is fanned out with no rollback on partial
@@ -534,7 +527,7 @@ class HiCacheController:
                 f"{storage_backend!r} while MLA/NSA host-memory dedup is "
                 f"active: non-rank-0 attn-TP ranks hold dummy host pools "
                 f"(kv_buffer=None) and this backend would dereference them. "
-                f"Only None/''/'file' backends can attach later in dedup "
+                f"Only None/''/'file'/'mooncake' backends can attach later in dedup "
                 f"mode. Restart the server with "
                 f"--hicache-storage-backend={storage_backend} to use this "
                 f"backend (every rank will then keep a full host pool)."
@@ -802,24 +795,6 @@ class HiCacheController:
         start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
-        if self._mla_skip_host_io and not self.has_draft:
-            # Dummy target host pool on this rank: skip D2H, just ack.
-            ack_start_event.record()
-            ack_finish_event.record()
-            self.last_write_finish_event = ack_finish_event
-            self.ack_write_queue.append(
-                HiCacheAck(
-                    start_event=ack_start_event,
-                    finish_event=ack_finish_event,
-                    node_ids=op.node_ids,
-                    num_tokens=len(op.device_indices),
-                    timing_enabled=timing_enabled,
-                    num_tokens_by_pool={PoolName.KV.value: len(op.device_indices)},
-                    num_bytes=0,
-                )
-            )
-            return
-
         target_host_indices, target_device_indices = self._resolve_write_indices(
             op, self.mem_pool_host
         )
@@ -864,9 +839,10 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
-            self._record_indices_on_write_stream(
-                target_host_indices, target_device_indices
-            )
+            if not self._mla_skip_host_io:
+                self._record_indices_on_write_stream(
+                    target_host_indices, target_device_indices
+                )
             if self.has_draft:
                 self._record_indices_on_write_stream(
                     draft_host_indices, draft_device_indices
@@ -890,7 +866,9 @@ class HiCacheController:
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         """Total bytes moved by a merged transfer op (draft piggyback included)."""
         num_tokens = len(op.device_indices)
-        num_bytes = num_tokens * self.mem_pool_host.size_per_token
+        num_bytes = 0
+        if not self._mla_skip_host_io:
+            num_bytes += num_tokens * self.mem_pool_host.size_per_token
         if self.has_draft:
             num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
         return num_bytes
@@ -1050,28 +1028,34 @@ class HiCacheController:
                 # therefore makes this layer visible to the forward stream while
                 # later layers continue loading.
                 broadcast_start = self._mla_trace_event(trace)
-                if trace is None:
-                    self.mla_broadcaster.broadcast_loaded_layer(i, broadcast_plan)
-                else:
-                    self.mla_broadcaster.broadcast_loaded_layer(
-                        i, broadcast_plan, trace=trace
-                    )
+                self.mla_broadcaster.broadcast_loaded_layer(
+                    i, broadcast_plan, trace=trace
+                )
                 self._finish_mla_trace_phase(trace, "broadcast_total", broadcast_start)
+
+                # homogeneous mtp draft is deduped, thus broadcast is required.
+                if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
+                    if source_state is not None:
+                        mtp_h2d_start = self._mla_trace_event(trace)
+                        self._load_mla_source_layer(source_state, i, is_mtp_draft=True)
+                        self._finish_mla_trace_phase(trace, "mtp_h2d", mtp_h2d_start)
+
+                    mtp_broadcast_start = self._mla_trace_event(trace)
+                    self.mla_broadcaster.broadcast_loaded_mtp_draft(
+                        self.mtp_draft_device_pools[i],
+                        broadcast_plan,
+                        trace=trace,
+                    )
+                    self._finish_mla_trace_phase(
+                        trace, "mtp_broadcast_total", mtp_broadcast_start
+                    )
+
+                # heterogeneous draft is not deduped, thus broadcast is not required.
                 if draft_state is not None:
                     draft_start = self._mla_trace_event(trace)
                     self._load_draft_layer(draft_state, i)
                     self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
 
-                # A draft can theoretically contain more layers than the target.
-                # Preserve the previous dedup path's all-draft completion guarantee
-                # by placing any tail before the final target-layer event.
-                if i == self.layer_num - 1 and draft_state is not None:
-                    for draft_layer_id in range(
-                        self.layer_num, self.mem_pool_host_draft.layer_num
-                    ):
-                        draft_start = self._mla_trace_event(trace)
-                        self._load_draft_layer(draft_state, draft_layer_id)
-                        self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
                 producer_event.complete(i)
                 if trace is not None:
                     layer_ready = device_module.Event(enable_timing=True)
@@ -1080,7 +1064,8 @@ class HiCacheController:
 
             if source_state is not None:
                 self._record_mla_source_load(source_state)
-            self._record_draft_load(draft_state)
+            if draft_state is not None:
+                self._record_mla_source_load(draft_state)
             ack_finish_event.record()
             if trace is not None:
                 trace["finish"] = device_module.Event(enable_timing=True)
@@ -1203,16 +1188,26 @@ class HiCacheController:
         return self.move_indices(op.host_indices, op.device_indices)
 
     def _load_mla_source_layer(
-        self, source_state: tuple[torch.Tensor, torch.Tensor], layer_id: int
+        self,
+        source_state: tuple[torch.Tensor, torch.Tensor],
+        layer_id: int,
+        is_mtp_draft: bool = False,
     ) -> None:
-        """Load one target layer on the dedup source rank."""
+        """Load one target layer or mtp draft layer on the dedup source rank."""
         host_indices, device_indices = source_state
+        kv_pool = self.mem_pool_device
+        if is_mtp_draft:
+            draft_depth = layer_id
+            kv_pool = self.mtp_draft_device_pools[draft_depth]
+            layer_id = self.layer_num + draft_depth
+
         self.mem_pool_host.load_to_device_per_layer(
-            self.mem_pool_device,
+            kv_pool,
             host_indices,
             device_indices,
             layer_id,
             self.io_backend,
+            is_draft=is_mtp_draft,
         )
 
     def _record_mla_source_load(
@@ -1253,17 +1248,6 @@ class HiCacheController:
             self.io_backend,
         )
 
-    def _record_draft_load(
-        self, draft_state: Optional[tuple[torch.Tensor, torch.Tensor]]
-    ) -> None:
-        if draft_state is None:
-            return
-        host_indices, device_indices = draft_state
-        if host_indices.is_cuda:
-            host_indices.record_stream(self.load_stream)
-        if device_indices.is_cuda:
-            device_indices.record_stream(self.load_stream)
-
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
         return len(device_indices)
@@ -1277,12 +1261,6 @@ class HiCacheController:
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
         """Register a full local draft KV pool for HiCache L2 transfers."""
-        if self.mla_broadcast_enabled and self.enable_storage:
-            raise NotImplementedError(
-                "Draft HiCache L3 storage is not supported together with MLA "
-                "host-memory dedup. Draft L2 host cache is supported, but L3 "
-                "needs per-rank draft storage keys."
-            )
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
@@ -1292,9 +1270,6 @@ class HiCacheController:
             draft_host_pool.size,
         )
 
-        # L3 is rejected above for MLA dedup because draft shards need a
-        # rank-qualified storage key. The normal non-dedup path can still
-        # register its existing draft L3 I/O here.
         self._maybe_register_draft_with_storage()
 
     def set_mtp_draft_pools(self, device_pools) -> None:
@@ -1406,11 +1381,6 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
-        # Dummy host pool: only the src rank reads L3; mark complete so the
-        # MIN-synced cross-rank accounting stays consistent.
-        if self._mla_skip_host_io:
-            operation.increment(len(operation.hash_value) * self.page_size)
-            return
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1426,9 +1396,16 @@ class HiCacheController:
                 self._draft_page_get(batch_hashes, batch_host_indices)
 
             prev_completed_tokens = operation.completed_tokens
-            # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            if not self._mla_skip_host_io:
+                # Get one target batch and update completed_tokens on success.
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                self.page_get_func(
+                    operation, batch_hashes, batch_host_indices, extra_info
+                )
+            else:
+                # Target L3 is source-owned. The peer has already restored its
+                # separate draft state above, so keep cross-rank progress aligned.
+                operation.increment(len(batch_hashes) * self.page_size)
             # Check termination
             if (
                 operation.completed_tokens
@@ -1641,7 +1618,11 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = True
+            if not self._mla_skip_host_io:
+                success = self.page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
+                )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
@@ -1666,7 +1647,7 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
+                if not self.backup_skip or self.has_draft:
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
