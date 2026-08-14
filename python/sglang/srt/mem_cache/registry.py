@@ -115,7 +115,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.enable_hierarchical_cache:
-        if ctx.is_hybrid_ssm or ctx.is_hybrid_swa or ctx.is_dsa:
+        if ctx.is_hybrid_ssm or ctx.is_hybrid_swa or ctx.is_dsa or ctx.enable_mla_hicache_host_dedup:
             # HybridModel and DSA (e.g. DeepSeek V3.2 / GLM-5.1) launch
             # HiCache via UnifiedRadixCache by default.
             return _create_unified_radix_cache(ctx, server_args, params)

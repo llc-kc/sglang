@@ -640,6 +640,8 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    mla_kv_is_dummy: bool = False,
+    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
@@ -658,6 +660,7 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        is_dummy=mla_kv_is_dummy,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -712,6 +715,8 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        mla_dedup_prebuild=mla_dedup_prebuild,
+        enable_mla_hicache_host_dedup=server_args.enable_mla_hicache_host_dedup,
     )
     if mtp_draft_device_pools:
         cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
@@ -1234,6 +1239,19 @@ class _MambaStrategy(StackStrategy):
 
         full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        mla_kv_is_dummy = is_mla_dedup_dummy_rank(
+            kvcache.full_kv_pool,
+            storage_backend,
+            server_args.enable_mla_hicache_host_dedup,
+        )
+        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
+            kvcache.full_kv_pool,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            storage_backend,
+            server_args.enable_mla_hicache_host_dedup,
+        )
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             server_args=server_args,
@@ -1250,6 +1268,8 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            mla_kv_is_dummy=mla_kv_is_dummy,
+            mla_dedup_prebuild=mla_dedup_prebuild,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
