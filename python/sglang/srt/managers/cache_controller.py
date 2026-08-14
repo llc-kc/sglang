@@ -864,9 +864,7 @@ class HiCacheController:
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         """Total bytes moved by a merged transfer op (draft piggyback included)."""
         num_tokens = len(op.device_indices)
-        num_bytes = 0
-        if not self._mla_skip_host_io:
-            num_bytes += num_tokens * self.mem_pool_host.size_per_token
+        num_bytes = num_tokens * self.mem_pool_host.size_per_token
         if self.has_draft:
             num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
         return num_bytes
@@ -1009,27 +1007,38 @@ class HiCacheController:
             broadcast_plan = self.mla_broadcaster.prepare_broadcast(
                 op.device_indices, self.load_stream
             )
-
+            # DSA, hybrid, draft sidecars
             source_state = None
+            # hybrid, draft sidecars
+            peer_state = None
             if self.mla_broadcaster.is_src:
                 source_state = self._prepare_mla_source_load(op)
-            draft_state = self._prepare_draft_load(op)
+            else:
+                peer_state = self._prepare_mla_peer_load(op)
 
             for i in range(self.layer_num):
                 if source_state is not None:
                     h2d_start = self._mla_trace_event(trace)
                     self._load_mla_source_layer(source_state, i)
                     self._finish_mla_trace_phase(trace, "h2d", h2d_start)
+                elif peer_state is not None:
+                    h2d_start = self._mla_trace_event(trace)
+                    self._load_mla_peer_layer(peer_state, i)
+                    self._finish_mla_trace_phase(trace, "peer_h2d", h2d_start)
 
                 # H2D, staging gather, NCCL broadcast, and receiver scatter are
                 # all enqueued on load_stream.  Recording the layer event below
                 # therefore makes this layer visible to the forward stream while
                 # later layers continue loading.
-                broadcast_start = self._mla_trace_event(trace)
-                self.mla_broadcaster.broadcast_loaded_layer(
-                    i, broadcast_plan, trace=trace
-                )
-                self._finish_mla_trace_phase(trace, "broadcast_total", broadcast_start)
+                mla_layer_id = self._mla_broadcast_layer_id(i)
+                if mla_layer_id is not None:
+                    broadcast_start = self._mla_trace_event(trace)
+                    self.mla_broadcaster.broadcast_loaded_layer(
+                        mla_layer_id, broadcast_plan, trace=trace
+                    )
+                    self._finish_mla_trace_phase(
+                        trace, "broadcast_total", broadcast_start
+                    )
 
                 # homogeneous mtp draft is deduped, thus broadcast is required.
                 if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
@@ -1048,12 +1057,6 @@ class HiCacheController:
                         trace, "mtp_broadcast_total", mtp_broadcast_start
                     )
 
-                # heterogeneous draft is not deduped, thus broadcast is not required.
-                if draft_state is not None:
-                    draft_start = self._mla_trace_event(trace)
-                    self._load_draft_layer(draft_state, i)
-                    self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
-
                 producer_event.complete(i)
                 if trace is not None:
                     layer_ready = device_module.Event(enable_timing=True)
@@ -1062,8 +1065,8 @@ class HiCacheController:
 
             if source_state is not None:
                 self._record_mla_source_load(source_state)
-            if draft_state is not None:
-                self._record_mla_source_load(draft_state)
+            if peer_state is not None:
+                self._record_mla_source_load(peer_state)
             ack_finish_event.record()
             if trace is not None:
                 trace["finish"] = device_module.Event(enable_timing=True)
@@ -1185,6 +1188,20 @@ class HiCacheController:
         """Resolve source-rank indices once for the layerwise H2D loop."""
         return self.move_indices(op.host_indices, op.device_indices)
 
+    def _prepare_mla_peer_load(self, op: CacheOperation):
+        """Prepare rank-local, non-deduplicated state on an MLA peer.
+        Plain MLA controllers have no such state.
+        """
+        return None
+
+    def _load_mla_peer_layer(self, peer_state, layer_id: int) -> None:
+        """Load one rank-local hybrid layer on a non-source dedup rank."""
+        return None
+
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        """Map a controller transfer layer to the dense MLA buffer layer."""
+        return transfer_layer_id
+
     def _load_mla_source_layer(
         self,
         source_state: tuple[torch.Tensor, torch.Tensor],
@@ -1216,35 +1233,6 @@ class HiCacheController:
             host_indices.record_stream(self.load_stream)
         if device_indices.is_cuda:
             device_indices.record_stream(self.load_stream)
-
-    def _prepare_draft_load(
-        self, op: CacheOperation
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Resolve locally owned draft indices once on every attention-TP rank.
-
-        MLA host dedup is valid only for the target pool. The draft pool remains
-        a complete, per-rank L2 cache because its KV layout may be TP-sharded.
-        """
-        if not self.has_draft:
-            return None
-
-        return self.move_indices(op.host_indices, op.device_indices)
-
-    def _load_draft_layer(
-        self,
-        draft_state: Optional[tuple[torch.Tensor, torch.Tensor]],
-        layer_id: int,
-    ) -> None:
-        if draft_state is None or layer_id >= self.mem_pool_host_draft.layer_num:
-            return
-        host_indices, device_indices = draft_state
-        self.mem_pool_host_draft.load_to_device_per_layer(
-            self.mem_pool_device_draft,
-            host_indices,
-            device_indices,
-            layer_id,
-            self.io_backend,
-        )
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
