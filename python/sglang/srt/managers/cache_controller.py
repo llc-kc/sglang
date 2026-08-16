@@ -842,7 +842,11 @@ class HiCacheController:
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         """Total bytes moved by a merged transfer op (draft piggyback included)."""
         num_tokens = len(op.device_indices)
-        num_bytes = num_tokens * self.mem_pool_host.size_per_token
+        num_bytes = (
+            0
+            if self._mla_skip_host_io
+            else num_tokens * self.mem_pool_host.size_per_token
+        )
         if self.has_draft:
             num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
         return num_bytes
@@ -895,13 +899,24 @@ class HiCacheController:
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
         """Keep CPU host indices only for page-first staged write-back."""
+        host_pool = (
+            self.mem_pool_host_draft
+            if self._mla_skip_host_io and self.has_draft
+            else self.mem_pool_host
+        )
+        return (*self._move_indices_for_host_pool(op, host_pool), op.pool_transfers)
+
+    def _move_indices_for_host_pool(
+        self, op: CacheOperation, host_pool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve one operation for the transfer path selected by ``host_pool``."""
         if (
             self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and host_pool.layout == "page_first"
+            and getattr(host_pool, "can_use_write_back_jit", False)
         ):
-            return op.host_indices, op.device_indices, op.pool_transfers
-        return self._move_op_indices(op)
+            return op.host_indices, op.device_indices
+        return self.move_indices(op.host_indices, op.device_indices)
 
     def _move_op_indices(
         self, op: CacheOperation
@@ -914,14 +929,16 @@ class HiCacheController:
         device_indices: torch.Tensor,
         pool_transfers: Optional[List[PoolTransfer]] = None,
     ) -> list[L2Transfer]:
-        transfers = [
-            L2Transfer(
-                host_pool=self.mem_pool_host,
-                device_pool=self.mem_pool_device,
-                host_indices=host_indices,
-                device_indices=device_indices,
+        transfers = []
+        if not self._mla_skip_host_io:
+            transfers.append(
+                L2Transfer(
+                    host_pool=self.mem_pool_host,
+                    device_pool=self.mem_pool_device,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
             )
-        ]
         if self.has_draft and host_indices.numel() > 0:
             transfers.append(
                 L2Transfer(
@@ -983,13 +1000,14 @@ class HiCacheController:
         producer_event.start_event.record()
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+        load_stream = self.l2_transfer_engine.host_to_device_stream
 
-        with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
+        with device_module.stream(load_stream):
+            producer_event.start_event.wait(load_stream)
             ack_start_event.record()
             trace = self._begin_mla_trace(op)
             broadcast_plan = self.mla_broadcaster.prepare_broadcast(
-                op.device_indices, self.load_stream
+                op.device_indices, load_stream
             )
 
             source_state = None
@@ -1004,9 +1022,9 @@ class HiCacheController:
                     self._finish_mla_trace_phase(trace, "h2d", h2d_start)
 
                 # H2D, staging gather, NCCL broadcast, and receiver scatter are
-                # all enqueued on load_stream.  Recording the layer event below
-                # therefore makes this layer visible to the forward stream while
-                # later layers continue loading.
+                # all enqueued on the L2 load stream. Recording the layer event
+                # below therefore makes this layer visible to the forward stream
+                # while later layers continue loading.
                 broadcast_start = self._mla_trace_event(trace)
                 if trace is None:
                     self.mla_broadcaster.broadcast_loaded_layer(i, broadcast_plan)
@@ -1050,7 +1068,7 @@ class HiCacheController:
         # model-TP collectives while later dedup broadcasts are still pending
         # on a separate NCCL communicator. Drain the dedup load stream on every
         # rank before forward resumes to avoid a cross-communicator deadlock.
-        self.load_stream.synchronize()
+        load_stream.synchronize()
 
         self.ack_load_queue.append(
             HiCacheAck(
@@ -1177,10 +1195,11 @@ class HiCacheController:
         self, source_state: tuple[torch.Tensor, torch.Tensor]
     ) -> None:
         host_indices, device_indices = source_state
+        load_stream = self.l2_transfer_engine.host_to_device_stream
         if host_indices.is_cuda:
-            host_indices.record_stream(self.load_stream)
+            host_indices.record_stream(load_stream)
         if device_indices.is_cuda:
-            device_indices.record_stream(self.load_stream)
+            device_indices.record_stream(load_stream)
 
     def _prepare_draft_load(
         self, op: CacheOperation
@@ -1217,10 +1236,11 @@ class HiCacheController:
         if draft_state is None:
             return
         host_indices, device_indices = draft_state
+        load_stream = self.l2_transfer_engine.host_to_device_stream
         if host_indices.is_cuda:
-            host_indices.record_stream(self.load_stream)
+            host_indices.record_stream(load_stream)
         if device_indices.is_cuda:
-            device_indices.record_stream(self.load_stream)
+            device_indices.record_stream(load_stream)
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

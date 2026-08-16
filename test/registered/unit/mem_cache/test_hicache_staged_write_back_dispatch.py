@@ -9,15 +9,15 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers import cache_controller as manager_cache_controller
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheOperation
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
@@ -207,7 +207,7 @@ class _FakeDeviceModule:
 
     @staticmethod
     def Stream():
-        return object()
+        return _FakeStream()
 
     @staticmethod
     @contextmanager
@@ -248,6 +248,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.has_draft = False
         controller.has_mtp_draft = False
+        controller.mla_broadcast_enabled = False
+        controller._mla_skip_host_io = False
         controller._l2_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_transfers(controller, *args)
         )
@@ -1172,16 +1174,12 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device_draft = object()
         controller.has_draft = True
         controller.mla_broadcaster = SimpleNamespace(is_src=False)
-        controller.write_stream = object()
         controller.ack_write_queue = []
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
         )
 
-        with mock.patch.object(
-            manager_cache_controller, "device_module", _FakeDeviceModule
-        ):
-            controller.start_writing()
+        self._start_writing(controller)
 
         self.assertEqual(target_writes, [])
         self.assertEqual(len(draft_writes), 1)
@@ -1234,6 +1232,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ),
         )
         controller.load_stream = _FakeStream()
+        controller.l2_transfer_engine = SimpleNamespace(
+            host_to_device_stream=controller.load_stream
+        )
         controller.ack_load_queue = []
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
@@ -1316,6 +1317,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ),
         )
         controller.load_stream = _FakeStream(operations)
+        controller.l2_transfer_engine = SimpleNamespace(
+            host_to_device_stream=controller.load_stream
+        )
         controller.ack_load_queue = []
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
@@ -1526,15 +1530,14 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mla_broadcaster = SimpleNamespace(is_src=True)
         controller.producer_stream = producer_stream
         controller.last_write_finish_event = None
-        controller.write_stream = write_stream
         controller.ack_write_queue = []
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
         )
 
-        with mock.patch.object(
-            manager_cache_controller, "device_module", _FakeDeviceModule
-        ):
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("direct")
+            controller.l2_transfer_engine.device_to_host_stream = write_stream
             controller.start_writing()
 
         self.assertEqual(write_stream.waited_streams, [producer_stream])
@@ -1575,13 +1578,21 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.write_queue = [op]
         controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeTargetHostPool()
+        target_host_pool = FakeTargetHostPool()
+        target_host_pool._is_dummy = True
         controller.mem_pool_device = object()
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=SimpleNamespace(
+                host_pool=target_host_pool,
+                device_pool=controller.mem_pool_device,
+                layer_mapper=None,
+            ),
+            entry_map={},
+        )
         controller.mem_pool_host_draft = FakeDraftHostPool()
         controller.mem_pool_device_draft = object()
         controller.has_draft = True
         controller.mla_broadcaster = SimpleNamespace(is_src=False)
-        controller.write_stream = object()
         controller.ack_write_queue = []
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, None)
@@ -1590,10 +1601,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._num_tokens_by_pool = lambda op: {"kv": len(op.device_indices)}
         controller._transfer_num_bytes = lambda op: 0
 
-        with mock.patch.object(
-            hybrid_cache_controller, "device_module", _FakeDeviceModule
-        ):
-            controller.start_writing()
+        self._start_writing(controller)
 
         self.assertEqual(target_writes, [])
         self.assertEqual(len(draft_writes), 1)
@@ -1648,19 +1656,17 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ),
         )
         controller.load_stream = _FakeStream(operations)
+        controller.l2_transfer_engine = SimpleNamespace(
+            host_to_device_stream=controller.load_stream
+        )
         controller.ack_load_queue = []
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, pool_transfers)
         )
         controller._record_transfer_indices_on_stream = mock.Mock()
 
-        with (
-            mock.patch.object(
-                hybrid_cache_controller, "device_module", _FakeDeviceModule
-            ),
-            mock.patch.object(
-                manager_cache_controller, "device_module", _FakeDeviceModule
-            ),
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
         ):
             controller.start_loading()
 
@@ -1677,7 +1683,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ],
         )
         controller._record_transfer_indices_on_stream.assert_called_once_with(
-            controller.load_stream,
+            controller.l2_transfer_engine.host_to_device_stream,
             op.host_indices,
             op.device_indices,
             pool_transfers,

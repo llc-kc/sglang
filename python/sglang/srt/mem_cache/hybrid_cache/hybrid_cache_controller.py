@@ -376,6 +376,14 @@ class HybridCacheController(BaseHiCacheController):
     def _move_write_operation(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        if self._mla_skip_host_io:
+            if self.has_draft:
+                host_indices, device_indices = self._move_indices_for_host_pool(
+                    op, self.mem_pool_host_draft
+                )
+                return host_indices, device_indices, None
+            return op.host_indices, op.device_indices, None
+
         host_group = self.mem_pool_host
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
@@ -421,7 +429,10 @@ class HybridCacheController(BaseHiCacheController):
     ) -> list[L2Transfer]:
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
-        if host_indices.numel() > 0:
+        if (
+            host_indices.numel() > 0
+            and getattr(anchor.host_pool, "_is_dummy", False) is not True
+        ):
             transfers.append(
                 L2Transfer(
                     host_pool=anchor.host_pool,
@@ -438,6 +449,8 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            if getattr(entry.host_pool, "_is_dummy", False) is True:
+                continue
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
@@ -514,7 +527,11 @@ class HybridCacheController(BaseHiCacheController):
         including draft piggyback and sidecar transfers riding another
         pool's indices (both excluded from the per-pool token counts)."""
         kv_tokens = len(op.device_indices)
-        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        num_bytes = (
+            0
+            if self._mla_skip_host_io
+            else kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        )
         if self.has_draft:
             num_bytes += kv_tokens * self.mem_pool_host_draft.size_per_token
         # Slot counts of the pools sidecars can ride on.
@@ -524,7 +541,7 @@ class HybridCacheController(BaseHiCacheController):
                 source_len[t.name] = len(t.host_indices)
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
-            if entry is None:
+            if entry is None or getattr(entry.host_pool, "_is_dummy", False) is True:
                 continue
             if t.indices_from_pool is not None:
                 num_slots = source_len.get(t.indices_from_pool, 0)
@@ -617,6 +634,7 @@ class HybridCacheController(BaseHiCacheController):
                 transfer.host_indices.record_stream(stream)
             if transfer.device_indices is not None and transfer.device_indices.is_cuda:
                 transfer.device_indices.record_stream(stream)
+
     def prefetch(
         self,
         request_id: str,

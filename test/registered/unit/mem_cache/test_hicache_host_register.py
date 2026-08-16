@@ -1,10 +1,15 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
+from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import _cuda_host_register
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -35,6 +40,55 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
+    def test_page_first_direct_mla_uses_page_registration_granularity(self):
+        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        pool.layout = "page_first_direct"
+        pool.page_num = 4
+        pool.layer_num = 3
+        pool.page_size = 2
+        pool.kv_cache_dim = 5
+        pool.dtype = torch.float16
+        pool.device_pool = SimpleNamespace(device="cuda")
+        pool.device = "cpu"
+        pool.pin_memory = True
+        pool.allocator = object()
+        alloc = mock.Mock(return_value=object())
+
+        with mock.patch.dict(mla_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
+            pool.init_kv_buffer()
+
+        self.assertEqual(
+            alloc.call_args.kwargs["registration_granularity_bytes"],
+            pool.page_size * pool.layer_num * pool.kv_cache_dim * pool.dtype.itemsize,
+        )
+
+    def test_page_first_direct_mha_uses_page_registration_granularity(self):
+        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        pool.layout = "page_first_direct"
+        pool.page_num = 4
+        pool.layer_num = 3
+        pool.page_size = 2
+        pool.head_num = 2
+        pool.head_dim = 4
+        pool.dtype = torch.float16
+        pool.device_pool = SimpleNamespace(device="cuda")
+        pool.device = "cpu"
+        pool.pin_memory = True
+        pool.allocator = object()
+        alloc = mock.Mock(return_value=object())
+
+        with mock.patch.dict(mha_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
+            pool.init_kv_buffer()
+
+        self.assertEqual(
+            alloc.call_args.kwargs["registration_granularity_bytes"],
+            pool.page_size
+            * pool.layer_num
+            * pool.head_num
+            * pool.head_dim
+            * pool.dtype.itemsize,
+        )
+
     def test_registration_boundaries_honor_page_copy_granularity(self):
         mib = 1024**2
         gib = 1024**3

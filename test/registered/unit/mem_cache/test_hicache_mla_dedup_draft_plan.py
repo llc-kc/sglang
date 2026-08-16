@@ -6,6 +6,7 @@ from unittest import mock
 
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.speculative import base_spec_worker
 from sglang.srt.speculative.base_spec_worker import (
     BaseSpecWorker,
     HiCacheDraftMode,
@@ -49,7 +50,12 @@ class TestHiCacheMLADedupDraftPlan(unittest.TestCase):
     def test_dedup_keeps_nextn_draft_rank_local(self):
         worker, target_runner, draft_pool = _nextn_worker(enable_dedup=True)
 
-        plan = BaseSpecWorker._build_hicache_draft_plan(worker)
+        with mock.patch.object(
+            base_spec_worker,
+            "get_memory",
+            return_value=SimpleNamespace(enable_hierarchical_cache=True),
+        ):
+            plan = BaseSpecWorker._build_hicache_draft_plan(worker)
 
         self.assertEqual(plan.mode, HiCacheDraftMode.SIDECAR)
         self.assertEqual(plan.device_pools, (draft_pool,))
@@ -58,7 +64,12 @@ class TestHiCacheMLADedupDraftPlan(unittest.TestCase):
     def test_normal_hicache_still_packs_nextn_draft(self):
         worker, target_runner, draft_pool = _nextn_worker(enable_dedup=False)
 
-        plan = BaseSpecWorker._build_hicache_draft_plan(worker)
+        with mock.patch.object(
+            base_spec_worker,
+            "get_memory",
+            return_value=SimpleNamespace(enable_hierarchical_cache=True),
+        ):
+            plan = BaseSpecWorker._build_hicache_draft_plan(worker)
 
         self.assertEqual(plan.mode, HiCacheDraftMode.PACKED)
         self.assertEqual(plan.device_pools, (draft_pool,))
