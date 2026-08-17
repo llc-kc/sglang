@@ -536,6 +536,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.init_prefill_cache_dumper()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -676,6 +677,20 @@ class Scheduler(
             device_module=self.tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
+
+    def init_prefill_cache_dumper(self) -> None:
+        from sglang.srt.managers.prefill_cache_dumper import PrefillCacheDumper
+
+        self.prefill_cache_dumper = PrefillCacheDumper(
+            self.server_args.prefill_kv_cache_dump_path,
+            tp_rank=self.ps.tp_rank,
+            pp_rank=self.ps.pp_rank,
+            dp_rank=self.ps.dp_rank,
+            gpu_id=self.ps.gpu_id,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            draft_worker=self.draft_worker,
+        )
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -1800,6 +1815,16 @@ class Scheduler(
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
             and batch_is_extend
+            and last_batch_is_extend
+        )
+
+        # Cache snapshotting is synchronous by design. Drain the completed
+        # prefill result before launching any subsequent batch so a decode (or a
+        # concurrent cache writer) cannot mutate the exported boundary state.
+        prefill_cache_dumper = getattr(self, "prefill_cache_dumper", None)
+        disable_overlap_for_batch = disable_overlap_for_batch or bool(
+            prefill_cache_dumper
+            and prefill_cache_dumper.enabled
             and last_batch_is_extend
         )
 
@@ -3816,12 +3841,23 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
+            # Capture eligibility before the result processor decrements an
+            # in-flight middle chunk to zero. That decrement does not mean the
+            # request has completed its final prefill chunk.
+            completed_prefill_reqs = [
+                req
+                for req in batch.reqs
+                if getattr(req, "inflight_middle_chunks", 0) <= 0
+            ]
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
+            prefill_cache_dumper = getattr(self, "prefill_cache_dumper", None)
+            if prefill_cache_dumper is not None:
+                prefill_cache_dumper.dump_batch(batch, reqs=completed_prefill_reqs)
         elif batch.forward_mode.is_prebuilt():
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():

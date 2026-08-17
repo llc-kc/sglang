@@ -708,6 +708,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
+                # The remote decode worker may start as soon as the final KV
+                # transfer completes, so persist before initiating that transfer.
+                prefill_cache_dumper = getattr(self, "prefill_cache_dumper", None)
+                if prefill_cache_dumper is not None:
+                    prefill_cache_dumper.dump_request(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]

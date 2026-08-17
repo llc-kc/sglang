@@ -923,6 +923,13 @@ class ServerArgs:
     disable_radix_cache: A[
         bool, "Disable RadixAttention for prefix caching.", NS("memory")
     ] = False
+    prefill_kv_cache_dump_path: A[
+        Optional[str],
+        "Local directory in which each TP/PP rank synchronously saves per-request "
+        "dense KV, Mamba state, and draft KV snapshots after prefill and before "
+        "decode. Disabled when unset.",
+        NS("memory"),
+    ] = None
     enable_page_major_kv_layout: A[
         bool,
         "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
