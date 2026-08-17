@@ -14,8 +14,10 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
+from collections import defaultdict
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -37,8 +39,17 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.l2_transfer import (
+    L2Transfer,
+    L2TransferEngine,
+    make_timing_event_pair,
+)
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    maybe_build_mla_broadcaster,
+    storage_supports_host_dedup,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -262,6 +273,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
+        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
+        enable_mla_hicache_host_dedup: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -319,6 +332,23 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        self.producer_stream = None
+        self.last_write_finish_event = None
+
+        if mla_dedup_prebuild is not None:
+            self.mla_broadcaster = mla_dedup_prebuild.broadcaster
+            self._prebuilt_prefetch_sync_groups = (
+                mla_dedup_prebuild.prefetch_sync_groups
+            )
+        else:
+            self.mla_broadcaster = maybe_build_mla_broadcaster(
+                self.mem_pool_device,
+                self.tp_group,
+                self.attn_tp_group,
+                storage_backend,
+                enable_mla_hicache_host_dedup,
+            )
+            self._prebuilt_prefetch_sync_groups = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -334,6 +364,28 @@ class HiCacheController:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
+    @property
+    def mla_broadcast_enabled(self) -> bool:
+        return self.mla_broadcaster is not None
+
+    def set_producer_stream(self, stream) -> None:
+        self.producer_stream = stream
+
+    def wait_for_last_write(self, stream) -> None:
+        finish_event = self.last_write_finish_event
+        if finish_event is not None:
+            stream.wait_event(finish_event)
+
+    @property
+    def _mla_skip_host_io(self) -> bool:
+        broadcaster = getattr(self, "mla_broadcaster", None)
+        return broadcaster is not None and not broadcaster.is_src
+
+    def _destroy_mla_broadcast_group(self) -> None:
+        if self.mla_broadcaster is not None:
+            self.mla_broadcaster.destroy()
+            self.mla_broadcaster = None
+
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
         if self.attn_cp_group is not None:
@@ -344,6 +396,11 @@ class HiCacheController:
         return 0, 1
 
     def _create_prefetch_sync_groups(self) -> None:
+        if self._prebuilt_prefetch_sync_groups is not None:
+            self.prefetch_sync_groups = self._prebuilt_prefetch_sync_groups
+            self._prebuilt_prefetch_sync_groups = None
+            return
+
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         self.prefetch_sync_groups = []
@@ -464,6 +521,28 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
+        if self.mla_broadcast_enabled and self.has_draft:
+            raise RuntimeError(
+                "Cannot attach HiCache L3 storage while MLA host-memory dedup "
+                "and a local draft L2 cache are both active. Draft L3 needs "
+                "per-rank storage keys and is not implemented."
+            )
+
+        # Reject on every rank to avoid a partially attached server.
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            storage_backend
+        ):
+            raise RuntimeError(
+                f"Cannot runtime-attach non-dedup-compatible storage backend "
+                f"{storage_backend!r} while MLA/NSA host-memory dedup is "
+                f"active: non-rank-0 attn-TP ranks hold dummy host pools "
+                f"(kv_buffer=None) and this backend would dereference them. "
+                f"Only None/''/'file' backends can attach later in dedup "
+                f"mode. Restart the server with "
+                f"--hicache-storage-backend={storage_backend} to use this "
+                f"backend (every rank will then keep a full host pool)."
+            )
+
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
         try:
@@ -496,7 +575,13 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            if getattr(self.mem_pool_host, "_is_dummy", False):
+                logger.info(
+                    "Skipping register_mem_pool_host on dummy (non-rank-0 dedup) "
+                    "host pool with no KV buffer."
+                )
+            else:
+                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -716,10 +801,15 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
+        producer_stream = getattr(self, "producer_stream", None)
+        if producer_stream is not None:
+            self.l2_transfer_engine.device_to_host_stream.wait_stream(producer_stream)
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
+        # Fence the next model forward behind this D2H copy.
+        self.last_write_finish_event = completion.finish_event
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -735,7 +825,11 @@ class HiCacheController:
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         """Total bytes moved by a merged transfer op (draft piggyback included)."""
         num_tokens = len(op.device_indices)
-        num_bytes = num_tokens * self.mem_pool_host.size_per_token
+        num_bytes = (
+            0
+            if self._mla_skip_host_io
+            else num_tokens * self.mem_pool_host.size_per_token
+        )
         if self.has_draft:
             num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
         return num_bytes
@@ -788,13 +882,23 @@ class HiCacheController:
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
         """Keep CPU host indices only for page-first staged write-back."""
+        host_pool = (
+            self.mem_pool_host_draft
+            if self._mla_skip_host_io and self.has_draft
+            else self.mem_pool_host
+        )
+        return (*self._move_indices_for_host_pool(op, host_pool), op.pool_transfers)
+
+    def _move_indices_for_host_pool(
+        self, op: CacheOperation, host_pool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and host_pool.layout == "page_first"
+            and getattr(host_pool, "can_use_write_back_jit", False)
         ):
-            return op.host_indices, op.device_indices, op.pool_transfers
-        return self._move_op_indices(op)
+            return op.host_indices, op.device_indices
+        return self.move_indices(op.host_indices, op.device_indices)
 
     def _move_op_indices(
         self, op: CacheOperation
@@ -807,14 +911,16 @@ class HiCacheController:
         device_indices: torch.Tensor,
         pool_transfers: Optional[List[PoolTransfer]] = None,
     ) -> list[L2Transfer]:
-        transfers = [
-            L2Transfer(
-                host_pool=self.mem_pool_host,
-                device_pool=self.mem_pool_device,
-                host_indices=host_indices,
-                device_indices=device_indices,
+        transfers = []
+        if not self._mla_skip_host_io:
+            transfers.append(
+                L2Transfer(
+                    host_pool=self.mem_pool_host,
+                    device_pool=self.mem_pool_device,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
             )
-        ]
         if self.has_draft and host_indices.numel() > 0:
             transfers.append(
                 L2Transfer(
@@ -840,8 +946,12 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
+
+        if self.mla_broadcast_enabled:
+            return self._start_loading_mla(producer_id, op)
+
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -865,6 +975,240 @@ class HiCacheController:
         )
         return producer_id
 
+    def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
+        """Layerwise H2D on the dedup source followed by layerwise broadcast."""
+        self._log_ready_mla_traces()
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
+
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+        load_stream = self.l2_transfer_engine.host_to_device_stream
+
+        with device_module.stream(load_stream):
+            producer_event.start_event.wait(load_stream)
+            ack_start_event.record()
+            trace = self._begin_mla_trace(op)
+            broadcast_plan = self.mla_broadcaster.prepare_broadcast(
+                op.device_indices, load_stream
+            )
+
+            source_state = None
+            if self.mla_broadcaster.is_src:
+                source_state = self._prepare_mla_source_load(op)
+            draft_state = self._prepare_draft_load(op)
+
+            for i in range(self.layer_num):
+                if source_state is not None:
+                    h2d_start = self._mla_trace_event(trace)
+                    self._load_mla_source_layer(source_state, i)
+                    self._finish_mla_trace_phase(trace, "h2d", h2d_start)
+
+                # Release each layer after its load-stream work is enqueued.
+                broadcast_start = self._mla_trace_event(trace)
+                if trace is None:
+                    self.mla_broadcaster.broadcast_loaded_layer(i, broadcast_plan)
+                else:
+                    self.mla_broadcaster.broadcast_loaded_layer(
+                        i, broadcast_plan, trace=trace
+                    )
+                self._finish_mla_trace_phase(trace, "broadcast_total", broadcast_start)
+                if draft_state is not None:
+                    draft_start = self._mla_trace_event(trace)
+                    self._load_draft_layer(draft_state, i)
+                    self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
+
+                # Load any draft tail before completing the final target layer.
+                if i == self.layer_num - 1 and draft_state is not None:
+                    for draft_layer_id in range(
+                        self.layer_num, self.mem_pool_host_draft.layer_num
+                    ):
+                        draft_start = self._mla_trace_event(trace)
+                        self._load_draft_layer(draft_state, draft_layer_id)
+                        self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
+                producer_event.complete(i)
+                if trace is not None:
+                    layer_ready = device_module.Event(enable_timing=True)
+                    layer_ready.record()
+                    trace["layer_ready"].append(layer_ready)
+
+            if source_state is not None:
+                self._record_mla_source_load(source_state)
+            self._record_draft_load(draft_state)
+            ack_finish_event.record()
+            if trace is not None:
+                trace["finish"] = device_module.Event(enable_timing=True)
+                trace["finish"].record()
+                trace["cpu_submit_end"] = time.perf_counter()
+                self._mla_trace_pending.append(trace)
+
+        # Avoid overlapping dedup and model-TP communicators across ranks.
+        load_stream.synchronize()
+
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=ack_start_event,
+                finish_event=ack_finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
+            )
+        )
+        return producer_id
+
+    def _begin_mla_trace(self, op: CacheOperation):
+        if os.environ.get("SGLANG_MLA_DEDUP_TRACE", "0") != "1":
+            return None
+        issued = getattr(self, "_mla_trace_issued", 0)
+        limit = int(os.environ.get("SGLANG_MLA_DEDUP_TRACE_LIMIT", "20"))
+        if issued >= limit:
+            return None
+        self._mla_trace_issued = issued + 1
+        if not hasattr(self, "_mla_trace_pending"):
+            self._mla_trace_pending = []
+        start = device_module.Event(enable_timing=True)
+        start.record()
+        return {
+            "id": issued,
+            "tokens": int(op.device_indices.numel()),
+            "start": start,
+            "finish": None,
+            "layer_ready": [],
+            "events": [],
+            "cpu_submit_start": time.perf_counter(),
+        }
+
+    @staticmethod
+    def _mla_trace_event(trace):
+        if trace is None:
+            return None
+        event = device_module.Event(enable_timing=True)
+        event.record()
+        return event
+
+    @staticmethod
+    def _finish_mla_trace_phase(trace, name: str, start, num_bytes: int = 0):
+        if trace is None:
+            return
+        end = device_module.Event(enable_timing=True)
+        end.record()
+        trace["events"].append((name, start, end, num_bytes))
+
+    def _log_ready_mla_traces(self) -> None:
+        pending = getattr(self, "_mla_trace_pending", None)
+        if not pending:
+            return
+
+        remaining = []
+        for trace in pending:
+            finish = trace["finish"]
+            if finish is None or not finish.query():
+                remaining.append(trace)
+                continue
+
+            phase_ms = defaultdict(float)
+            phase_calls = defaultdict(int)
+            phase_bytes = defaultdict(int)
+            for name, start, end, num_bytes in trace["events"]:
+                phase_ms[name] += start.elapsed_time(end)
+                phase_calls[name] += 1
+                phase_bytes[name] += num_bytes
+
+            layer_ready = trace["layer_ready"]
+            first_layer_ms = (
+                trace["start"].elapsed_time(layer_ready[0]) if layer_ready else 0.0
+            )
+            total_ms = trace["start"].elapsed_time(finish)
+            cpu_submit_ms = (trace["cpu_submit_end"] - trace["cpu_submit_start"]) * 1000
+            role = "src" if self.mla_broadcaster.is_src else "peer"
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            phases = ",".join(
+                f"{name}={phase_ms[name]:.3f}ms/{phase_calls[name]}calls/"
+                f"{phase_bytes[name] / (1024 * 1024):.1f}MiB"
+                for name in sorted(phase_ms)
+            )
+            logger.info(
+                "[MLA_DEDUP_TRACE] id=%d rank=%d role=%s tokens=%d "
+                "first_layer_ms=%.3f total_ms=%.3f cpu_submit_ms=%.3f phases=%s",
+                trace["id"],
+                rank,
+                role,
+                trace["tokens"],
+                first_layer_ms,
+                total_ms,
+                cpu_submit_ms,
+                phases,
+            )
+
+        self._mla_trace_pending = remaining
+
+    def _prepare_mla_source_load(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.move_indices(op.host_indices, op.device_indices)
+
+    def _load_mla_source_layer(
+        self, source_state: tuple[torch.Tensor, torch.Tensor], layer_id: int
+    ) -> None:
+        host_indices, device_indices = source_state
+        self.mem_pool_host.load_to_device_per_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            layer_id,
+            self.io_backend,
+        )
+
+    def _record_mla_source_load(
+        self, source_state: tuple[torch.Tensor, torch.Tensor]
+    ) -> None:
+        host_indices, device_indices = source_state
+        load_stream = self.l2_transfer_engine.host_to_device_stream
+        if host_indices.is_cuda:
+            host_indices.record_stream(load_stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(load_stream)
+
+    def _prepare_draft_load(
+        self, op: CacheOperation
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Keep draft KV rank-local because it may be TP-sharded."""
+        if not self.has_draft:
+            return None
+
+        return self.move_indices(op.host_indices, op.device_indices)
+
+    def _load_draft_layer(
+        self,
+        draft_state: Optional[tuple[torch.Tensor, torch.Tensor]],
+        layer_id: int,
+    ) -> None:
+        if draft_state is None or layer_id >= self.mem_pool_host_draft.layer_num:
+            return
+        host_indices, device_indices = draft_state
+        self.mem_pool_host_draft.load_to_device_per_layer(
+            self.mem_pool_device_draft,
+            host_indices,
+            device_indices,
+            layer_id,
+            self.io_backend,
+        )
+
+    def _record_draft_load(
+        self, draft_state: Optional[tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        if draft_state is None:
+            return
+        host_indices, device_indices = draft_state
+        load_stream = self.l2_transfer_engine.host_to_device_stream
+        if host_indices.is_cuda:
+            host_indices.record_stream(load_stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(load_stream)
+
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
         return len(device_indices)
@@ -877,7 +1221,12 @@ class HiCacheController:
         return len(host_indices)
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
+        if self.mla_broadcast_enabled and self.enable_storage:
+            raise NotImplementedError(
+                "Draft HiCache L3 storage is not supported together with MLA "
+                "host-memory dedup. Draft L2 host cache is supported, but L3 "
+                "needs per-rank draft storage keys."
+            )
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
@@ -887,8 +1236,6 @@ class HiCacheController:
             draft_host_pool.size,
         )
 
-        # If storage is already attached, wire up the draft I/O path now.
-        # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
 
     def set_mtp_draft_pools(self, device_pools) -> None:
@@ -1000,6 +1347,10 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
+        # Keep cross-rank completion accounting aligned on dummy ranks.
+        if self._mla_skip_host_io:
+            operation.increment(len(operation.hash_value) * self.page_size)
+            return
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):

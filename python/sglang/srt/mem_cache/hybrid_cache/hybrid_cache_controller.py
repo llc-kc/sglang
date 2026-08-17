@@ -32,6 +32,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    storage_supports_host_dedup,
+)
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 if TYPE_CHECKING:
@@ -112,6 +116,8 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
+        enable_mla_hicache_host_dedup: bool = False,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -131,12 +137,28 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            mla_dedup_prebuild=mla_dedup_prebuild,
+            enable_mla_hicache_host_dedup=enable_mla_hicache_host_dedup,
         )
+        # Re-apply the dedup gate with the startup storage backend.
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            startup_storage_backend
+        ):
+            self._destroy_mla_broadcast_group()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
+            # Extra transfer layers are not part of the dedup broadcast.
+            if self.mla_broadcast_enabled:
+                logger.info(
+                    "Disabling MLA host-dedup broadcast: transfer layer count "
+                    "(%d) exceeds the MLA KV layers, so extra hybrid pools "
+                    "(e.g. Mamba) are not deduplicated.",
+                    self.layer_num,
+                )
+                self._destroy_mla_broadcast_group()
 
         if startup_storage_backend is not None:
             self.attach_storage_backend(
@@ -167,6 +189,8 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            if getattr(entry.host_pool, "_is_dummy", False):
+                continue
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
@@ -347,6 +371,14 @@ class HybridCacheController(BaseHiCacheController):
     def _move_write_operation(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        if self._mla_skip_host_io:
+            if self.has_draft:
+                host_indices, device_indices = self._move_indices_for_host_pool(
+                    op, self.mem_pool_host_draft
+                )
+                return host_indices, device_indices, None
+            return op.host_indices, op.device_indices, None
+
         host_group = self.mem_pool_host
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
@@ -392,7 +424,10 @@ class HybridCacheController(BaseHiCacheController):
     ) -> list[L2Transfer]:
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
-        if host_indices.numel() > 0:
+        if (
+            host_indices.numel() > 0
+            and getattr(anchor.host_pool, "_is_dummy", False) is not True
+        ):
             transfers.append(
                 L2Transfer(
                     host_pool=anchor.host_pool,
@@ -409,6 +444,8 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            if getattr(entry.host_pool, "_is_dummy", False) is True:
+                continue
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
@@ -485,7 +522,11 @@ class HybridCacheController(BaseHiCacheController):
         including draft piggyback and sidecar transfers riding another
         pool's indices (both excluded from the per-pool token counts)."""
         kv_tokens = len(op.device_indices)
-        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        num_bytes = (
+            0
+            if self._mla_skip_host_io
+            else kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        )
         if self.has_draft:
             num_bytes += kv_tokens * self.mem_pool_host_draft.size_per_token
         # Slot counts of the pools sidecars can ride on.
@@ -495,7 +536,7 @@ class HybridCacheController(BaseHiCacheController):
                 source_len[t.name] = len(t.host_indices)
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
-            if entry is None:
+            if entry is None or getattr(entry.host_pool, "_is_dummy", False) is True:
                 continue
             if t.indices_from_pool is not None:
                 num_slots = source_len.get(t.indices_from_pool, 0)
@@ -546,6 +587,46 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return device_indices
+
+    def _prepare_mla_source_load(self, op: CacheOperation):
+        return self.move_hybrid_indices(op)
+
+    def _load_mla_source_layer(self, source_state, layer_id: int) -> None:
+        host_indices, device_indices, resolved_pool_transfers = source_state
+        self.mem_pool_host.load_to_device_per_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_indices,
+            layer_id,
+            self.io_backend,
+            pool_transfers=resolved_pool_transfers,
+        )
+
+    def _record_mla_source_load(self, source_state) -> None:
+        host_indices, device_indices, resolved_pool_transfers = source_state
+        self._record_transfer_indices_on_stream(
+            self.l2_transfer_engine.host_to_device_stream,
+            host_indices,
+            device_indices,
+            resolved_pool_transfers,
+        )
+
+    def _record_transfer_indices_on_stream(
+        self,
+        stream: torch.Stream,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> None:
+        if host_indices.is_cuda:
+            host_indices.record_stream(stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(stream)
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                transfer.host_indices.record_stream(stream)
+            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
+                transfer.device_indices.record_stream(stream)
 
     def prefetch(
         self,
@@ -638,6 +719,12 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
+        # Dummy ranks only participate in completion accounting.
+        if self._mla_skip_host_io:
+            operation.increment(len(operation.hash_value) * self.page_size)
+            operation.pool_transfers_done = True
+            return
+
         # KV pools first — determines actual completed page count
         super()._page_transfer(operation)
 
