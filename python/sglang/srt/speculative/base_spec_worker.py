@@ -250,10 +250,7 @@ class BaseSpecWorker(ABC):
                 "HiCache does not support Inkling MTP draft state yet."
             )
 
-        # MLA host dedup broadcasts only the target MLA/DSA payload. Keep the
-        # draft cache rank-local so each TP rank restores its own draft shard;
-        # packing draft layers into the target host pool would make peer ranks
-        # depend on the source rank's dummy/replicated target pool instead.
+        # Draft KV may be TP-sharded, so dedup keeps it rank-local.
         if (
             _can_pack_hicache_mtp(spec_algorithm, draft_runners)
             and not self.server_args.enable_mla_hicache_host_dedup

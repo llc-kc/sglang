@@ -152,7 +152,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         dcp_rank: int,
         pool_label: str,
     ) -> None:
-        """Initialize allocator bookkeeping without allocating host KV data."""
         self.device_pool = device_pool
         self.pool_label = pool_label
         self.dcp_size = dcp_size

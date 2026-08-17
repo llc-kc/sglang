@@ -121,9 +121,7 @@ def get_allocator_type(server_args) -> str:
 def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
-    # Register in chunks of SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB (default 256GB).
-    # Some driver/silicon combinations fail and corrupt the CUDA context when a
-    # single cudaHostRegister call exceeds roughly 500-600GB.
+    # Avoid oversized cudaHostRegister calls on large host pools.
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
@@ -143,9 +141,7 @@ def _cuda_host_register(
                 f"granularity={registration_granularity_bytes}, "
                 f"chunk_limit={chunk_limit_bytes}"
             )
-        # cudaMemcpyAsync validates a host range against a single registered
-        # allocation.  Keep registration boundaries aligned to the largest D2H
-        # copy unit so a page copy never straddles two cudaHostRegister calls.
+        # A copied page must stay within one registered range.
         chunk_bytes = (
             chunk_limit_bytes // registration_granularity_bytes
         ) * registration_granularity_bytes

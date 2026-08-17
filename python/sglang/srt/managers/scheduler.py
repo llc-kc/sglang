@@ -3679,9 +3679,7 @@ class Scheduler(
                         self.enable_hierarchical_cache
                         and self.tree_cache.cache_controller.mla_broadcast_enabled
                     ):
-                        # MLA host-dedup D2H runs on the L2 write stream. Fence the
-                        # next forward before it can reuse or overwrite those
-                        # slots. Keep ordinary HiCache's existing overlap path.
+                        # Fence MLA dedup D2H before reusing its device slots.
                         self.tree_cache.cache_controller.wait_for_last_write(
                             self.forward_stream
                         )

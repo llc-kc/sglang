@@ -21,12 +21,12 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
-from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupPrebuild,
     is_mla_dedup_dummy_rank,
     maybe_prebuild_mla_host_dedup,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
@@ -104,7 +104,6 @@ def build_kv_host_pool(
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
     if use_mla and is_dummy:
-        # Dedup dummy rank: allocator-only host pool (no buffer).
         kwargs["is_dummy"] = True
     return kv_host_pool_cls(
         kv_pool,
@@ -925,7 +924,6 @@ def build_anchor_sidecar_stack(
         is_dummy=is_dummy,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool, is_dummy)
-    # Let HostPoolGroup dispatch packed MTP tail layers through the normal path.
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
@@ -1500,9 +1498,7 @@ class _DsaStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
 
-        # MLA/DSA host dedup: dummy pools on non-src ranks; prebuild the
-        # process groups before the slow host KV alloc (NCCL-watchdog race,
-        # see maybe_prebuild_mla_host_dedup).
+        # Initialize dedup groups before the slow host-pool allocation.
         mla_is_dummy = is_mla_dedup_dummy_rank(
             kvcache, storage_backend, server_args.enable_mla_hicache_host_dedup
         )
@@ -1656,8 +1652,6 @@ class _PlainKvStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
 
-        # Same dedup gating + watchdog prebuild as the DSA path; MHA pools
-        # gate to False/None.
         mla_is_dummy = is_mla_dedup_dummy_rank(
             kvcache, storage_backend, server_args.enable_mla_hicache_host_dedup
         )
@@ -1975,7 +1969,6 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
 
-        # MLA/DSA host dedup: dummy KV + indexer pools on non-src ranks.
         mla_is_dummy = is_mla_dedup_dummy_rank(
             kv,
             server_args.hicache_storage_backend,

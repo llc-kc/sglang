@@ -332,15 +332,9 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
-        # In overlap mode, model forward writes KV on a separate stream while
-        # HiCache reads it back on the L2 engine stream. These dependencies
-        # protect both directions without a device-wide synchronize.
         self.producer_stream = None
         self.last_write_finish_event = None
 
-        # MLA/DSA host-memory dedup (see mla_host_dedup): consume the groups
-        # the caller prebuilt before the slow host KV alloc, else build
-        # inline with the same gating.
         if mla_dedup_prebuild is not None:
             self.mla_broadcaster = mla_dedup_prebuild.broadcaster
             self._prebuilt_prefetch_sync_groups = (
@@ -375,18 +369,15 @@ class HiCacheController:
         return self.mla_broadcaster is not None
 
     def set_producer_stream(self, stream) -> None:
-        """Register the model-forward stream that produces device KV."""
         self.producer_stream = stream
 
     def wait_for_last_write(self, stream) -> None:
-        """Fence a consumer stream behind the latest enqueued D2H write."""
         finish_event = self.last_write_finish_event
         if finish_event is not None:
             stream.wait_event(finish_event)
 
     @property
     def _mla_skip_host_io(self) -> bool:
-        """Non-src dedup ranks: dummy host pools, no D2H backup or L3 reads."""
         broadcaster = getattr(self, "mla_broadcaster", None)
         return broadcaster is not None and not broadcaster.is_src
 
@@ -405,8 +396,6 @@ class HiCacheController:
         return 0, 1
 
     def _create_prefetch_sync_groups(self) -> None:
-        # Reuse caller-prebuilt gloo groups (see maybe_prebuild_mla_host_dedup);
-        # clear the slot so a runtime detach→re-attach builds fresh.
         if self._prebuilt_prefetch_sync_groups is not None:
             self.prefetch_sync_groups = self._prebuilt_prefetch_sync_groups
             self._prebuilt_prefetch_sync_groups = None
@@ -539,11 +528,7 @@ class HiCacheController:
                 "per-rank storage keys and is not implemented."
             )
 
-        # While dedup is active, non-src ranks hold buffer-less dummy host
-        # pools that RDMA/registered backends would dereference. Reject on
-        # EVERY rank: attach is fanned out with no rollback on partial
-        # failure, so a rank-asymmetric reject would leave the server
-        # half-attached.
+        # Reject on every rank to avoid a partially attached server.
         if self.mla_broadcast_enabled and not storage_supports_host_dedup(
             storage_backend
         ):
@@ -590,7 +575,6 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
-            # Dummy host pool: no buffer to register; this rank never reads L3.
             if getattr(self.mem_pool_host, "_is_dummy", False):
                 logger.info(
                     "Skipping register_mem_pool_host on dummy (non-rank-0 dedup) "
@@ -824,8 +808,7 @@ class HiCacheController:
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
-        # The next model forward must not reuse/write these slots until D2H is
-        # done. Scheduler inserts this event into forward_stream.
+        # Fence the next model forward behind this D2H copy.
         self.last_write_finish_event = completion.finish_event
         self.ack_write_queue.append(
             HiCacheAck(
@@ -909,7 +892,6 @@ class HiCacheController:
     def _move_indices_for_host_pool(
         self, op: CacheOperation, host_pool
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resolve one operation for the transfer path selected by ``host_pool``."""
         if (
             self.io_backend == "kernel"
             and host_pool.layout == "page_first"
@@ -1021,10 +1003,7 @@ class HiCacheController:
                     self._load_mla_source_layer(source_state, i)
                     self._finish_mla_trace_phase(trace, "h2d", h2d_start)
 
-                # H2D, staging gather, NCCL broadcast, and receiver scatter are
-                # all enqueued on the L2 load stream. Recording the layer event
-                # below therefore makes this layer visible to the forward stream
-                # while later layers continue loading.
+                # Release each layer after its load-stream work is enqueued.
                 broadcast_start = self._mla_trace_event(trace)
                 if trace is None:
                     self.mla_broadcaster.broadcast_loaded_layer(i, broadcast_plan)
@@ -1038,9 +1017,7 @@ class HiCacheController:
                     self._load_draft_layer(draft_state, i)
                     self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
 
-                # A draft can theoretically contain more layers than the target.
-                # Preserve the previous dedup path's all-draft completion guarantee
-                # by placing any tail before the final target-layer event.
+                # Load any draft tail before completing the final target layer.
                 if i == self.layer_num - 1 and draft_state is not None:
                     for draft_layer_id in range(
                         self.layer_num, self.mem_pool_host_draft.layer_num
@@ -1064,10 +1041,7 @@ class HiCacheController:
                 trace["cpu_submit_end"] = time.perf_counter()
                 self._mla_trace_pending.append(trace)
 
-        # Peer ranks skip the source H2D copies and can otherwise return to
-        # model-TP collectives while later dedup broadcasts are still pending
-        # on a separate NCCL communicator. Drain the dedup load stream on every
-        # rank before forward resumes to avoid a cross-communicator deadlock.
+        # Avoid overlapping dedup and model-TP communicators across ranks.
         load_stream.synchronize()
 
         self.ack_load_queue.append(
@@ -1082,7 +1056,6 @@ class HiCacheController:
         return producer_id
 
     def _begin_mla_trace(self, op: CacheOperation):
-        """Create a bounded, asynchronous CUDA-event trace for MLA dedup."""
         if os.environ.get("SGLANG_MLA_DEDUP_TRACE", "0") != "1":
             return None
         issued = getattr(self, "_mla_trace_issued", 0)
@@ -1175,13 +1148,11 @@ class HiCacheController:
     def _prepare_mla_source_load(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resolve source-rank indices once for the layerwise H2D loop."""
         return self.move_indices(op.host_indices, op.device_indices)
 
     def _load_mla_source_layer(
         self, source_state: tuple[torch.Tensor, torch.Tensor], layer_id: int
     ) -> None:
-        """Load one target layer on the dedup source rank."""
         host_indices, device_indices = source_state
         self.mem_pool_host.load_to_device_per_layer(
             self.mem_pool_device,
@@ -1204,11 +1175,7 @@ class HiCacheController:
     def _prepare_draft_load(
         self, op: CacheOperation
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Resolve locally owned draft indices once on every attention-TP rank.
-
-        MLA host dedup is valid only for the target pool. The draft pool remains
-        a complete, per-rank L2 cache because its KV layout may be TP-sharded.
-        """
+        """Keep draft KV rank-local because it may be TP-sharded."""
         if not self.has_draft:
             return None
 
@@ -1254,7 +1221,6 @@ class HiCacheController:
         return len(host_indices)
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register a full local draft KV pool for HiCache L2 transfers."""
         if self.mla_broadcast_enabled and self.enable_storage:
             raise NotImplementedError(
                 "Draft HiCache L3 storage is not supported together with MLA "
@@ -1270,9 +1236,6 @@ class HiCacheController:
             draft_host_pool.size,
         )
 
-        # L3 is rejected above for MLA dedup because draft shards need a
-        # rank-qualified storage key. The normal non-dedup path can still
-        # register its existing draft L3 I/O here.
         self._maybe_register_draft_with_storage()
 
     def set_mtp_draft_pools(self, device_pools) -> None:
@@ -1384,8 +1347,7 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
-        # Dummy host pool: only the src rank reads L3; mark complete so the
-        # MIN-synced cross-rank accounting stays consistent.
+        # Keep cross-rank completion accounting aligned on dummy ranks.
         if self._mla_skip_host_io:
             operation.increment(len(operation.hash_value) * self.page_size)
             return

@@ -65,10 +65,7 @@ def maybe_register_hicache_draft(
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    # The dedup path intentionally keeps draft KV rank-local.  Register the
-    # draft as the legacy independent host pool even with UnifiedRadixCache;
-    # Unified sidecars are part of the target HostPoolGroup and peer ranks skip
-    # that group's host I/O while receiving the deduplicated target payload.
+    # Dedup keeps the potentially TP-sharded draft cache rank-local.
     if server_args.enable_mla_hicache_host_dedup or not isinstance(
         tree_cache, UnifiedRadixCache
     ):

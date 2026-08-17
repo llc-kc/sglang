@@ -140,9 +140,7 @@ class HybridCacheController(BaseHiCacheController):
             mla_dedup_prebuild=mla_dedup_prebuild,
             enable_mla_hicache_host_dedup=enable_mla_hicache_host_dedup,
         )
-        # The base gate ran with storage_backend=None; re-apply it with the
-        # real startup backend so broadcast never runs against full
-        # (non-dummy) pools.
+        # Re-apply the dedup gate with the startup storage backend.
         if self.mla_broadcast_enabled and not storage_supports_host_dedup(
             startup_storage_backend
         ):
@@ -152,9 +150,7 @@ class HybridCacheController(BaseHiCacheController):
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
-            # The broadcast indexes the MLA KV buffer by layer_num; an
-            # expanded transfer layer count (e.g. +Mamba state) would index
-            # out of bounds and the extra pools aren't deduped — disable.
+            # Extra transfer layers are not part of the dedup broadcast.
             if self.mla_broadcast_enabled:
                 logger.info(
                     "Disabling MLA host-dedup broadcast: transfer layer count "
@@ -193,7 +189,6 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
-            # Dummy pool: nothing to register; this rank never reads L3.
             if getattr(entry.host_pool, "_is_dummy", False):
                 continue
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
@@ -594,11 +589,9 @@ class HybridCacheController(BaseHiCacheController):
         return device_indices
 
     def _prepare_mla_source_load(self, op: CacheOperation):
-        """Resolve target and extra-pool indices once for layerwise H2D."""
         return self.move_hybrid_indices(op)
 
     def _load_mla_source_layer(self, source_state, layer_id: int) -> None:
-        """Load one target layer and its corresponding extra-pool data."""
         host_indices, device_indices, resolved_pool_transfers = source_state
         self.mem_pool_host.load_to_device_per_layer(
             self.mem_pool_device,
@@ -726,10 +719,7 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
-        # Dummy host pools (KV and indexer): no L3 reads on this rank. Must
-        # precede super()._page_transfer and the sidecar batch_get below;
-        # pool_transfers_done lets this rank pass the all-reduced termination
-        # check.
+        # Dummy ranks only participate in completion accounting.
         if self._mla_skip_host_io:
             operation.increment(len(operation.hash_value) * self.page_size)
             operation.pool_transfers_done = True

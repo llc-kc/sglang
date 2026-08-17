@@ -1,12 +1,4 @@
-"""Host-memory dedup for MLA/DSA HiCache across attention-TP ranks.
-
-MLA KV is identical on every attn-TP rank, so only the src rank (attn-TP
-rank 0) keeps a real host pool; the other ranks run allocator-only "dummy"
-pools and receive loaded pages via an NCCL broadcast on the load stream.
-
-Single source of truth for the dedup gating and the broadcast machinery —
-every dedup decision elsewhere must derive from these helpers.
-"""
+"""Deduplicate MLA/DSA host cache across attention-TP ranks."""
 
 from __future__ import annotations
 
@@ -35,9 +27,7 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-# Backends that never touch the host KV buffer directly, so they tolerate
-# the buffer-less dummy pools. RDMA/registered backends (mooncake/eic/simm/
-# hf3fs/nixl/aibrix) pin or register the buffer — dedup stays off for them.
+# These backends tolerate buffer-less host pools on non-source ranks.
 _DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
 
 
@@ -84,15 +74,7 @@ def is_mla_dedup_dummy_rank(
 
 
 class MLAHostDedupBroadcaster:
-    """Broadcasts host-loaded MLA KV (and DSA indexer) device pages from the
-    src rank to its attn-TP peers over a dedicated NCCL group.
-
-    Layers are broadcast one at a time so the controller can release each
-    layer to the model as soon as its H2D + broadcast finishes.  The staging
-    allocation retains the old all-layer size and is reinterpreted as a larger
-    per-layer token chunk.  Consequently, layerwise mode does not multiply the
-    NCCL call count by ``layer_num`` for large loads.
-    """
+    """Layerwise MLA/DSA broadcast over a dedicated NCCL group."""
 
     def __init__(
         self,
@@ -117,7 +99,6 @@ class MLAHostDedupBroadcaster:
             dtype=device_pool.kv_buffer[0].dtype,
             device=self.device,
         )
-        # DSA keeps a per-page indexer buffer that must be broadcast too.
         self.idx_bufs = None
         self.idx_elem = None
         self.idx_staging = None
@@ -143,15 +124,7 @@ class MLAHostDedupBroadcaster:
         tp_group: torch.distributed.ProcessGroup,
         attn_tp_group: Optional[torch.distributed.ProcessGroup],
     ) -> MLAHostDedupBroadcaster:
-        """Build and eagerly initialize the dedicated NCCL broadcast group.
-
-        Group construction alone does not initialize ProcessGroupNCCL's CUDA
-        resources.  Without a collective here, the first host-cache hit can
-        lazily allocate those resources while a large prefill has consumed the
-        remaining device-memory headroom.  All dedup participants already call
-        this method in lockstep, before the slow host-pool allocation, so this
-        is the safe point to force communicator initialization.
-        """
+        """Build and initialize the NCCL group before host-pool allocation."""
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         base_group = tp_group
@@ -166,16 +139,11 @@ class MLAHostDedupBroadcaster:
         return broadcaster
 
     def _warmup_group(self) -> None:
-        """Force the dedicated NCCL communicator to allocate before serving."""
-        # Reuse the staging allocation so warmup itself needs no extra device
-        # buffer.  Only the source value matters; peers receive it in place.
+        """Initialize the NCCL communicator before serving."""
         warmup = self.kv_staging[:1]
         if self.is_src:
             warmup.zero_()
         torch.distributed.broadcast(warmup, src=self.src_global_rank, group=self.group)
-        # NCCL collectives are enqueued asynchronously on the current stream.
-        # Complete this startup-only operation now so initialization failures
-        # surface here rather than during a request's host-cache load.
         torch.cuda.synchronize(self.device)
         logger.info("MLA host-dedup NCCL broadcast group warmup completed")
 
@@ -198,12 +166,7 @@ class MLAHostDedupBroadcaster:
                         "DSA dedup broadcast expects page-aligned device indices: "
                         f"got {indices.numel()} indices for page_size={page_size}."
                     )
-                # `indices` is ordered by logical cache position, while every
-                # attention-TP rank can allocate different physical pages.
-                # Keep one physical page id per logical page *in that order*.
-                # torch.unique() sorts by local physical id, which destroys the
-                # source-to-peer page correspondence and can also make collective
-                # payload sizes rank-dependent when physical pages repeat.
+                # Preserve logical page order across rank-local allocations.
                 page_idx = indices[::page_size] // page_size
             else:
                 page_idx = indices
@@ -250,14 +213,7 @@ class MLAHostDedupBroadcaster:
         trace=None,
         trace_prefix: str = "kv",
     ) -> None:
-        """Chunked in-place broadcast for one layer.
-
-        ``staging`` is sized for ``layer_num * chunk_tokens`` rows. Reusing
-        the full allocation for one layer preserves the previous maximum NCCL
-        payload size while enabling per-layer completion events.  ``index_select``
-        with an output tensor and ``index_copy_`` avoid the temporary tensors
-        created by advanced indexing in the original all-layer implementation.
-        """
+        """Broadcast one layer in chunks using the shared staging buffer."""
         n = target.shape[0]
         rows_per_chunk = staging.numel() // elem
         assert rows_per_chunk > 0
@@ -341,11 +297,9 @@ def maybe_build_mla_broadcaster(
 
 @dataclass
 class MLAHostDedupPrebuild:
-    """Groups/buffers rendezvoused ahead of the slow host KV allocation."""
+    """Dedup resources initialized before host KV allocation."""
 
     broadcaster: MLAHostDedupBroadcaster
-    # None without a storage backend, so a later runtime attach still builds
-    # its gloo groups inline.
     prefetch_sync_groups: Optional[List[torch.distributed.ProcessGroup]]
 
 
@@ -357,16 +311,7 @@ def maybe_prebuild_mla_host_dedup(
     storage_backend: Optional[str],
     enabled: bool = False,
 ) -> Optional[MLAHostDedupPrebuild]:
-    """Issue the controller's init-time world collectives BEFORE the host KV
-    pool is allocated.
-
-    The src rank can spend many minutes pinning host KV while the dummy
-    ranks race ahead into create_custom_parallel_group (NCCL bcast group +
-    gloo prefetch groups) and trip the 600s NCCL watchdog; prebuilding
-    completes the rendezvouses in lockstep first. Returns None when dedup
-    does not engage — same gating as the controller, so groups are never
-    built on ranks that would ignore them.
-    """
+    """Initialize dedup collectives before the slow host-pool allocation."""
     broadcaster = maybe_build_mla_broadcaster(
         kv_cache, tp_group, attn_tp_group, storage_backend, enabled
     )

@@ -48,11 +48,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.mla_host_dedup import (
     is_mla_dedup_dummy_rank,
     maybe_prebuild_mla_host_dedup,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
@@ -87,9 +87,7 @@ class HiRadixCache(RadixCache):
 
         allocator_type = get_allocator_type(server_args)
 
-        # Rendezvous the dedup process groups BEFORE the slow host KV alloc;
-        # otherwise rank 0's multi-minute pin races the dummy ranks into the
-        # 600s NCCL watchdog (see maybe_prebuild_mla_host_dedup).
+        # Initialize dedup groups before host-pool allocation.
         self._mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
             self.kv_cache,
             params.tp_cache_group,
@@ -127,7 +125,6 @@ class HiRadixCache(RadixCache):
                 allocator_type=allocator_type,
                 dcp_size=_parallel.attn_dcp_size,
                 dcp_rank=_parallel.attn_dcp_rank,
-                # Allocator-only on non-src dedup ranks (see mla_host_dedup).
                 is_dummy=is_mla_dedup_dummy_rank(
                     self.kv_cache,
                     server_args.hicache_storage_backend,
