@@ -229,6 +229,7 @@ def build_kv_only_group(
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    is_dummy: bool = False,
 ) -> HostPoolGroup:
     """Anchor-only host pool group for a flat MHA/MLA device pool."""
     transfer_layer_num = len(full_layer_mapping)
@@ -239,6 +240,7 @@ def build_kv_only_group(
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        is_dummy=is_dummy,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -796,10 +798,15 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    mla_kv_is_dummy: bool = False,
+    mla_dedup_context: Optional[MLAHostDedupContext] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+    )
 
     mtp_draft_device_pools = tuple(
         pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
@@ -816,6 +823,7 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        is_dummy=mla_kv_is_dummy,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -853,6 +861,22 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if isinstance(kv_pool, DSATokenToKVPool):
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=DSAIndexerPoolHost(
+                    kv_pool,
+                    kv_host_pool,
+                    get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                    is_dummy=mla_kv_is_dummy,
+                ),
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -872,6 +896,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup_context,
     )
     return host_pool_group, cache_controller
 
@@ -1409,6 +1434,17 @@ class _MambaStrategy(StackStrategy):
     ):
         full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        mla_dedup_context = maybe_create_mla_host_dedup_context(
+            kvcache.full_kv_pool,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            storage_backend,
+            get_memory().enable_mla_hicache_host_dedup,
+        )
+        mla_kv_is_dummy = (
+            mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
+        )
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             kv_pool=kvcache.full_kv_pool,
@@ -1424,7 +1460,17 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            mla_kv_is_dummy=mla_kv_is_dummy,
+            mla_dedup_context=mla_dedup_context,
         )
+        sidecars = []
+        if PoolName.INDEXER in host_pool_group.entry_map:
+            sidecars.append(
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                )
+            )
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
@@ -1432,9 +1478,10 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=sidecars,
             register_req_to_token_counter=True,
             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
-            pools_desc="KV + MAMBA",
+            pools_desc="KV + MAMBA" + (" + INDEXER" if sidecars else ""),
         )
 
 

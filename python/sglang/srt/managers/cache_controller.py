@@ -588,7 +588,7 @@ class HiCacheController:
                 f"{storage_backend!r} while MLA/NSA host-memory dedup is "
                 f"active: non-rank-0 attn-TP ranks hold dummy host pools "
                 f"(kv_buffer=None) and this backend would dereference them. "
-                f"Only None/''/'file' backends can attach later in dedup "
+                f"Only None/''/'file'/'mooncake' backends can attach later in dedup "
                 f"mode. Restart the server with "
                 f"--hicache-storage-backend={storage_backend} to use this "
                 f"backend (every rank will then keep a full host pool)."
@@ -1096,16 +1096,30 @@ class HiCacheController:
             )
 
             source_state = None
+            peer_state = None
             if broadcaster.is_src:
                 source_state = self._prepare_mla_source_load(op)
+            else:
+                peer_state = self._prepare_mla_peer_load(op)
             draft_state = self._prepare_draft_load(op)
+            packed_mtp_draft_pools = self._packed_mtp_draft_pools()
 
             for i in range(self.layer_num):
                 if source_state is not None:
                     self._load_mla_source_layer(source_state, i)
+                elif peer_state is not None:
+                    self._load_mla_peer_layer(peer_state, i)
 
                 # Release each layer after its load-stream work is enqueued.
-                broadcaster.broadcast_loaded_layer(i, broadcast_plan)
+                broadcast_layer_id = self._mla_broadcast_layer_id(i)
+                if broadcast_layer_id is not None:
+                    broadcaster.broadcast_loaded_layer(
+                        broadcast_layer_id, broadcast_plan
+                    )
+                if i < len(packed_mtp_draft_pools):
+                    broadcaster.broadcast_loaded_mtp_draft(
+                        packed_mtp_draft_pools[i], broadcast_plan
+                    )
                 if draft_state is not None:
                     self._load_draft_layer(draft_state, i)
 
@@ -1113,6 +1127,8 @@ class HiCacheController:
 
             if source_state is not None:
                 self._record_mla_source_load(source_state)
+            if peer_state is not None:
+                self._record_mla_source_load(peer_state)
             self._record_draft_load(draft_state)
             ack_finish_event.record()
 
@@ -1133,6 +1149,18 @@ class HiCacheController:
     def _prepare_mla_source_load(self, op: CacheOperation) -> list[L2Transfer]:
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         return self._l2_load_transfers(host_indices, device_indices, pool_transfers)
+
+    def _prepare_mla_peer_load(self, op: CacheOperation) -> Optional[list[L2Transfer]]:
+        return None
+
+    def _load_mla_peer_layer(self, peer_state: list[L2Transfer], layer_id: int) -> None:
+        self._load_mla_transfers_layer(peer_state, layer_id)
+
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        return transfer_layer_id
+
+    def _packed_mtp_draft_pools(self) -> tuple[object, ...]:
+        return ()
 
     def _load_mla_source_layer(
         self, source_state: list[L2Transfer], layer_id: int
@@ -1275,31 +1303,21 @@ class HiCacheController:
             count += 1
         return count
 
-    def _page_transfer(self, operation: PrefetchOperation) -> int:
-        # Dummy ranks contribute an optimistic value to the MIN reduction;
-        # only the source rank performs storage-to-host copies.
-        if self._mla_skip_host_io:
-            completed_pages = 0
-            for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-                batch_pages = min(STORAGE_BATCH_SIZE, len(operation.hash_value) - i)
-                if not operation.is_terminated():
-                    completed_pages += batch_pages
-                self.prefetch_sync_queue.put(
-                    PrefetchAck(
-                        rid=operation.request_id,
-                        completed_tokens=completed_pages * self.page_size,
-                        operation=operation,
-                    )
-                )
-            return completed_pages
+    def _local_storage_pool_transfers(
+        self, pool_transfers: Optional[List[PoolTransfer]]
+    ) -> List[PoolTransfer]:
+        return list(pool_transfers or [])
 
+    def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        kv_derived_transfers = [
-            transfer
-            for transfer in getattr(operation, "pool_transfers", None) or []
-            if transfer.indices_from_pool == PoolName.KV
-        ]
+        kv_derived_transfers = self._local_storage_pool_transfers(
+            [
+                transfer
+                for transfer in getattr(operation, "pool_transfers", None) or []
+                if transfer.indices_from_pool == PoolName.KV
+            ]
+        )
         all_success = True
         completed_pages = 0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1353,9 +1371,14 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
-        # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
+        # The source rank restores the deduplicated target KV. Peer ranks
+        # contribute an optimistic KV hit while still restoring local sidecars.
+        kv_hits = (
+            len(batch_hashes)
+            if self._mla_skip_host_io
+            else self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
         )
 
         # Read from KV-derived sidecar pools, if any.
@@ -1446,6 +1469,17 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _sync_storage_hit_count(
+        self, operation: PrefetchOperation, storage_hit_count: int
+    ) -> int:
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            storage_hit_count_tensor,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        return storage_hit_count_tensor.item()
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1459,15 +1493,9 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._sync_storage_hit_count(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

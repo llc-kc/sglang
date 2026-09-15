@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # These backends tolerate buffer-less host pools on non-source ranks.
-_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
+_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file", "mooncake"})
 
 
 def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
@@ -173,6 +173,51 @@ class MLAHostDedupBroadcaster:
                 page_idx,
                 self.idx_elem,
                 layer_id,
+            )
+
+    def broadcast_loaded_mtp_draft(
+        self,
+        draft_pool: MLATokenToKVPool,
+        prepared: tuple[torch.Tensor, Optional[torch.Tensor]],
+    ) -> None:
+        """Broadcast one packed, homogeneous MTP draft layer."""
+        indices, page_idx = prepared
+        if type(draft_pool) is not type(self.device_pool):
+            raise TypeError(
+                "Packed MTP dedup requires target and draft pools to have "
+                f"the same type, got {type(self.device_pool).__name__} and "
+                f"{type(draft_pool).__name__}."
+            )
+        if draft_pool.kv_cache_dim != self.device_pool.kv_cache_dim:
+            raise ValueError(
+                "Packed MTP dedup requires matching target and draft KV "
+                f"dimensions, got {self.device_pool.kv_cache_dim} and "
+                f"{draft_pool.kv_cache_dim}."
+            )
+        if draft_pool.layer_num != 1:
+            raise ValueError(
+                "Each packed MTP draft pool must contain exactly one layer, "
+                f"got {draft_pool.layer_num}."
+            )
+
+        self._bcast_layer(
+            draft_pool.kv_buffer,
+            self.kv_staging,
+            indices,
+            draft_pool.kv_cache_dim,
+            layer_id=0,
+        )
+        if self.idx_bufs is not None:
+            if not isinstance(draft_pool, DSATokenToKVPool):
+                raise TypeError("Packed DSA MTP dedup requires a DSA draft pool.")
+            if page_idx is None:
+                raise ValueError("Packed DSA MTP dedup requires page indices.")
+            self._bcast_layer(
+                draft_pool.index_k_with_scale_buffer,
+                self.idx_staging,
+                page_idx,
+                self.idx_elem,
+                layer_id=0,
             )
 
     def _bcast_layer(
