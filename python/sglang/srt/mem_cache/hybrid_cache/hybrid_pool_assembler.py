@@ -1158,6 +1158,8 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    mla_kv_is_dummy: bool = False,
+    mla_dedup_context: Optional[MLAHostDedupContext] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController, HostPoolGroupConfig]:
     """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
     then the Mamba state pool, which keeps its own host path."""
@@ -1194,6 +1196,7 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        is_dummy=mla_kv_is_dummy,
     )
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
@@ -1260,6 +1263,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup_context,
     )
     return host_pool_group, cache_controller, config
 
@@ -1844,6 +1848,17 @@ class _MambaStrategy(StackStrategy):
         mamba_layer_mapping = _stage_local_layer_mapping(
             params.req_to_token_pool.mamba_map, kvcache.start_layer
         )
+        mla_dedup_context = maybe_create_mla_host_dedup_context(
+            kvcache.full_kv_pool,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            storage_backend,
+            get_memory().enable_mla_hicache_host_dedup,
+        )
+        mla_kv_is_dummy = (
+            mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
+        )
         host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
             params=params,
             decls=kvcache.host_pool_decls(),
@@ -1860,6 +1875,8 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            mla_kv_is_dummy=mla_kv_is_dummy,
+            mla_dedup_context=mla_dedup_context,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -2186,6 +2203,13 @@ class _DsaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        config = prepare_host_pool_config(
+            decls=kvcache.host_pool_decls(),
+            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
+            transfer_layer_id_max=kvcache.layer_num,
+            transfer_page_size=params.page_size,
+            packed_draft_device_pools=params.mtp_draft_device_pools,
+        )
         mla_dedup_context = maybe_create_mla_host_dedup_context(
             kvcache,
             params.tp_cache_group,
@@ -2196,13 +2220,6 @@ class _DsaStrategy(StackStrategy):
         )
         mla_is_dummy = (
             mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
-        )
-        config = prepare_host_pool_config(
-            decls=kvcache.host_pool_decls(),
-            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
-            transfer_layer_id_max=kvcache.layer_num,
-            transfer_page_size=params.page_size,
-            packed_draft_device_pools=params.mtp_draft_device_pools,
         )
         host_pool_group = build_host_pool_group(config=config, is_dummy=mla_is_dummy)
         cache_controller = HybridCacheController(

@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
     maybe_create_mla_host_dedup_context,
+    storage_supports_host_dedup,
 )
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -32,7 +34,10 @@ class _FakeStream:
     pass
 
 
-class TestMLAHostDedupPrimitives(unittest.TestCase):
+class TestMLAHostDedupPrimitives(CustomTestCase):
+    def test_mooncake_supports_dummy_dedup_ranks(self):
+        self.assertTrue(storage_supports_host_dedup("mooncake"))
+
     def test_disabled_flag_is_a_noop(self):
         with mock.patch(
             "sglang.srt.mem_cache.mla_host_dedup.mla_host_dedup_eligible"
@@ -130,6 +135,21 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         with mock.patch.object(torch.distributed, "broadcast"):
             broadcaster._bcast_layer(received, staging, target, 4, layer_id=1)
         torch.testing.assert_close(received[1].index_select(0, target), expected)
+
+    def test_broadcast_skips_unowned_indexer_layers(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.is_src = True
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        buffers = [torch.empty(0, 4), torch.arange(12.0).reshape(3, 4)]
+        staging = torch.full((8,), -1.0)
+        target = torch.tensor([0, 2])
+        with mock.patch.object(torch.distributed, "broadcast") as broadcast:
+            broadcaster._bcast_layer(buffers, staging, target, 4, layer_id=0)
+            torch.testing.assert_close(staging, torch.full((8,), -1.0))
+            broadcaster._bcast_layer(buffers, staging, target, 4, layer_id=1)
+        self.assertEqual(broadcast.call_count, 1)
+        torch.testing.assert_close(staging.reshape(2, 4), buffers[1][target])
 
     def test_chunk_tokens_uses_environment(self):
         device_pool = _device_pool_stub(

@@ -257,11 +257,6 @@ class HybridCacheController(BaseHiCacheController):
         ):
             self.transfer_layer_id_max = transfer_layer_id_max
             self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
-            if self.mla_dedup_enabled:
-                logger.info(
-                    "Disabling MLA host dedup for extra hybrid transfer layers."
-                )
-                self._destroy_mla_dedup_context()
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -311,13 +306,6 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
-        if self.mla_dedup_enabled and any(
-            entry.name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER, PoolName.DRAFT_SWA)
-            for entry in host_pools or []
-        ):
-            raise RuntimeError(
-                "MLA host dedup with rank-local draft pools does not support L3 storage."
-            )
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):
@@ -372,15 +360,6 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
-        if (
-            self.mla_dedup_enabled
-            and self.enable_storage
-            and entry.name
-            in (PoolName.DRAFT, PoolName.DRAFT_INDEXER, PoolName.DRAFT_SWA)
-        ):
-            raise RuntimeError(
-                "MLA host dedup with rank-local draft pools does not support L3 storage."
-            )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
@@ -1074,35 +1053,11 @@ class HybridCacheController(BaseHiCacheController):
         )
         return device_indices
 
-    def _prepare_mla_source_load(self, op: CacheOperation) -> list[L2Transfer]:
-        transfers = self._prepare_mla_load_transfers(op)
-        draft_host_pools = self._draft_host_pool_ids()
-        return [
-            transfer
-            for transfer in transfers
-            if not transfer.is_draft and id(transfer.host_pool) not in draft_host_pools
-        ]
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        return self.mem_pool_host.anchor_entry.layer_mapper(transfer_layer_id)
 
-    def _prepare_draft_load(self, op: CacheOperation) -> Optional[list[L2Transfer]]:
-        transfers = self._prepare_mla_load_transfers(op)
-        draft_host_pools = self._draft_host_pool_ids()
-        draft_transfers = [
-            transfer
-            for transfer in transfers
-            if transfer.is_draft or id(transfer.host_pool) in draft_host_pools
-        ]
-        return draft_transfers or None
-
-    def _prepare_mla_load_transfers(self, op: CacheOperation) -> list[L2Transfer]:
-        host_indices, device_indices, pool_transfers = self.move_hybrid_indices(op)
-        return self._l2_load_transfers(host_indices, device_indices, pool_transfers)
-
-    def _draft_host_pool_ids(self) -> set[int]:
-        return {
-            id(entry.host_pool)
-            for name, entry in self.mem_pool_host.entry_map.items()
-            if name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER, PoolName.DRAFT_SWA)
-        }
+    def _packed_mtp_draft_pools(self) -> tuple[object, ...]:
+        return tuple(self.mem_pool_host.anchor_entry.packed_draft_device_pools)
 
     def prefetch(
         self,
@@ -1468,16 +1423,18 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             operation.query_pool_hit_pages = {}
             return hash_value, kv_hit_pages * self.page_size
-        if self._mla_skip_host_io:
-            return hash_value, len(hash_value) * self.page_size
-
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
             extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
         )
-        if operation.pool_transfers:
+        transfers = self._rank_local_pool_transfers(operation.pool_transfers)
+        if transfers:
             hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
+                hash_value, transfers, extra_info
+            )
+        elif self._mla_skip_host_io:
+            hit_result = PoolTransferResult(
+                kv_hit_pages=len(hash_value), extra_pool_hit_pages={}
             )
         else:
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
@@ -1497,6 +1454,9 @@ class HybridCacheController(BaseHiCacheController):
         for transfer in operation.pool_transfers or ():
             if transfer.name in pool_hits:
                 operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
+        operation.pool_storage_result.restorable_prefix_pages = (
+            hit_result.restorable_prefix_pages
+        )
 
         return (
             hash_value[:kv_hit_pages],
@@ -1589,10 +1549,8 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if (
-            not self._mla_skip_host_io
-            and not operation.is_terminated()
-            and kv_completed_pages == len(operation.hash_value)
+        if not operation.is_terminated() and kv_completed_pages == len(
+            operation.hash_value
         ):
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
@@ -1601,6 +1559,7 @@ class HybridCacheController(BaseHiCacheController):
                 for transfer in operation.pool_transfers
                 if transfer.indices_from_pool != PoolName.KV
             ]
+            transfers_nonkv = self._rank_local_pool_transfers(transfers_nonkv)
             sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
             sidecar_hit_pages = (
                 operation.sidecar_hit_pages
@@ -1616,11 +1575,12 @@ class HybridCacheController(BaseHiCacheController):
                     sidecar_hashes,
                     transfers_nonkv,
                 ):
-                    results.update(
-                        self.storage_backend.batch_get_v2(
-                            transfers, extra_info=extra_info
+                    if transfers:
+                        results.update(
+                            self.storage_backend.batch_get_v2(
+                                transfers, extra_info=extra_info
+                            )
                         )
-                    )
                 pool_hits = count_pool_hits(results)
             except Exception:
                 if not get_memory().enable_unified_memory:
@@ -1710,8 +1670,16 @@ class HybridCacheController(BaseHiCacheController):
         if not self.backup_skip:
             return True
 
-        # Kimi-K3 Mamba/KDA state is TP-sharded even when the primary MLA KV
-        # pool is replicated.
+        if self.mla_dedup_enabled:
+            # Every real side pool is rank-local in dedup mode. This includes
+            # hybrid Mamba/KDA state and all non-packed speculative draft
+            # pools. Only the dummy MLA/DSA anchor and indexer are skipped.
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            return entry is not None and not getattr(
+                entry.host_pool, "_is_dummy", False
+            )
+
+        # Preserve the pre-dedup MLA storage behavior for rank-sharded pools.
         if transfer.name == PoolName.MAMBA:
             return True
 
