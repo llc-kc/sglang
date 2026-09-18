@@ -270,11 +270,7 @@ class BaseSpecWorker(ABC):
                 "HiCache does not support Inkling MTP draft state yet."
             )
 
-        # Draft KV may be TP-sharded, so dedup keeps it rank-local.
-        if (
-            _can_pack_hicache_mtp(spec_algorithm, draft_runners)
-            and not get_memory().enable_mla_hicache_host_dedup
-        ):
+        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
