@@ -274,6 +274,37 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_speculative_sidecars_are_scoped_by_tp_rank(self):
+        store, _ = _make_store(is_mla_model=True, tp_rank=1, tp_size=2)
+        mla_host_cls = store._get_hybrid_page_component_keys.__globals__[
+            "MLATokenToKVPoolHost"
+        ]
+        mla_draft_pool = object.__new__(mla_host_cls)
+        store.registered_pools = {
+            PoolName.DRAFT: mla_draft_pool,
+            PoolName.DRAFT_INDEXER: object(),
+            PoolName.DRAFT_SWA: mla_draft_pool,
+            PoolName.INDEXER: object(),
+        }
+
+        draft_keys, _ = store._get_hybrid_page_component_keys(
+            ["page0"], PoolTransfer(PoolName.DRAFT)
+        )
+        draft_indexer_keys, _ = store._get_hybrid_page_component_keys(
+            ["page0"], PoolTransfer(PoolName.DRAFT_INDEXER)
+        )
+        draft_swa_keys, _ = store._get_hybrid_page_component_keys(
+            ["page0"], PoolTransfer(PoolName.DRAFT_SWA)
+        )
+        target_indexer_keys, _ = store._get_hybrid_page_component_keys(
+            ["page0"], PoolTransfer(PoolName.INDEXER)
+        )
+
+        self.assertEqual(draft_keys, ["page0_1_draft_k"])
+        self.assertEqual(draft_indexer_keys, ["page0_1_draft_indexer"])
+        self.assertEqual(draft_swa_keys, ["page0_1_draft_swa"])
+        self.assertEqual(target_indexer_keys, ["page0__indexer"])
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(
