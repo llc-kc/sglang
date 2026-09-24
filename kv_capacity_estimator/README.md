@@ -23,10 +23,9 @@ sglang serve MODEL_PATH \
   --enable-metrics \
   --kv-capacity-estimator-config '{
     "kv_bytes_per_token": 61505,
-    "capacities": ["200GiB", "400GiB", "800GiB", "1TiB", "2TiB"],
-    "target_hit_rate_ratio": 1.0,
-    "slide_window_size": 3000,
-    "output_path": "/tmp/kv-cache-result.json"
+	"page_size": 256,
+    "target_hit_rate_ratio": 0.99,
+    "slide_window_size": 3000
   }'
 ```
 

@@ -17,11 +17,13 @@ import logging
 import math
 import multiprocessing
 import os
+import functools
 import secrets
+import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -41,6 +43,8 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 _TOKENIZER_RUNTIME = None
+_PAGE_SIZE = None
+_INCLUDE_PARTIAL_PAGE = False
 _DEFAULT_SLIDE_WINDOW_SIZE = 3000
 _CAPACITY_PERCENTILES = (
     ("p90", "0.9", 0.9),
@@ -54,7 +58,6 @@ def _load_simulator_api():
     try:
         from kv_capacity_estimator import (
             ReplaySimulator,
-            TokenIdsRequest,
             simulation_config_from_dict,
         )
     except ImportError as error:
@@ -63,7 +66,7 @@ def _load_simulator_api():
             "wheel. Install it in the SGLang environment, for example: "
             "pip install kv_capacity_estimator-0.2.0-py3-none-any.whl"
         ) from error
-    return ReplaySimulator, TokenIdsRequest, simulation_config_from_dict
+    return ReplaySimulator, simulation_config_from_dict
 
 
 def _build_online_simulation_config(raw_config, config_factory):
@@ -199,9 +202,30 @@ def _create_tokenizer_runtime(server_args: ServerArgs):
 
 def _init_tokenizer_worker(server_args: ServerArgs) -> None:
     """Initialize one process-local SGLang tokenizer and serving pipeline."""
-    global _TOKENIZER_RUNTIME
+    global _TOKENIZER_RUNTIME, _PAGE_SIZE, _INCLUDE_PARTIAL_PAGE
     server_args.resolve_once()
     publish(server_args, role="tokenizer")
+    # These processes only run template rendering and CPU tokenization; they
+    # never do torch compute. Limit the OMP/MKL pool to one thread so dozens
+    # of spawned workers don't oversubscribe the CPUs.
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+    except ImportError:
+        pass
+    cfg = resolving_view(server_args)
+    from kv_capacity_estimator.defaults import DEFAULT_PAGE_SIZE
+
+    raw_sim_config = cfg.kv_capacity_estimator_config
+    if isinstance(raw_sim_config, str):
+        sim_config = json.loads(raw_sim_config) if raw_sim_config else {}
+    elif isinstance(raw_sim_config, dict):
+        sim_config = raw_sim_config
+    else:
+        sim_config = {}
+    _PAGE_SIZE = int(sim_config.get("page_size", DEFAULT_PAGE_SIZE))
+    _INCLUDE_PARTIAL_PAGE = bool(sim_config.get("include_partial_page", False))
     _TOKENIZER_RUNTIME = _create_tokenizer_runtime(server_args)
 
 
@@ -254,7 +278,21 @@ def _tokenize_chat_request(request_payload: dict[str, Any]):
             "multimodal processor expansion requires the model execution pipeline"
         )
     token_ids = _extract_token_ids(manager, processed)
-    return token_ids, time.perf_counter() - started_at
+
+    # Compute the chained page hashes inside the tokenizer process. This is
+    # pure-function CPU work over the same token list, and doing it here
+    # parallelizes it across the tokenizer pool instead of leaving it as a
+    # single-threaded step in the main process (which also competes for the
+    # GIL with the event loop). Returning ~N/64 page keys also shrinks the
+    # IPC payload by an order of magnitude.
+    from kv_capacity_estimator.pages import chained_page_hashes
+
+    page_keys = chained_page_hashes(
+        token_ids,
+        page_size=_PAGE_SIZE,
+        include_partial_page=_INCLUDE_PARTIAL_PAGE,
+    )
+    return page_keys, len(token_ids), time.perf_counter() - started_at
 
 
 class KvCapacityEstimatorMetrics:
@@ -591,11 +629,7 @@ class KvCapacityEstimatorService:
     """Parallelize tokenization and maintain one central online LRU simulator."""
 
     def __init__(self, server_args: ServerArgs) -> None:
-        (
-            ReplaySimulator,
-            TokenIdsRequest,
-            simulation_config_from_dict,
-        ) = _load_simulator_api()
+        ReplaySimulator, simulation_config_from_dict = _load_simulator_api()
         cfg = resolving_view(server_args)
 
         if cfg.tokenizer_worker_num < 1:
@@ -609,7 +643,6 @@ class KvCapacityEstimatorService:
         capacities = tuple(simulation_config.capacities)
 
         self.simulator = ReplaySimulator(simulation_config)
-        self.TokenIdsRequest = TokenIdsRequest
         self.capacities = capacities
         self.simulation_config = simulation_config
         self.output_path = Path(output_path) if output_path else None
@@ -634,6 +667,17 @@ class KvCapacityEstimatorService:
             initializer=_init_tokenizer_worker,
             initargs=(server_args,),
         )
+        # The simulator is stateful (one global LRU history), so all its
+        # updates must be serialized. Running them on a dedicated single
+        # worker thread keeps the ~10-20 ms of CPU work per request off the
+        # asyncio event loop, where it previously blocked request
+        # acceptance, IPC draining, and response streaming for every
+        # in-flight request.
+        self._simulator_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="kv-capacity-simulator",
+        )
+        self._simulator_lock = threading.Lock()
         self._condition = asyncio.Condition()
         self._accepting_requests = True
         self._pending_requests = 0
@@ -656,19 +700,100 @@ class KvCapacityEstimatorService:
     async def start(self) -> None:
         """Start every tokenizer process and surface initialization errors."""
         loop = asyncio.get_running_loop()
-        futures = [
-            loop.run_in_executor(self._executor, _tokenizer_worker_ping)
-            for _ in range(self.tokenizer_worker_num)
-        ]
-        worker_pids = set(await asyncio.gather(*futures))
+        # Spawned processes each re-initialize the tokenizer and chat
+        # template, which takes tens of seconds. A single burst of pings can
+        # all be consumed by the first ready process, so keep pinging until
+        # every worker PID has reported in; otherwise the server advertises
+        # readiness while most workers are still initializing.
+        started_at = time.perf_counter()
+        deadline = started_at + 900
+        worker_pids: set[int] = set()
+        while len(worker_pids) < self.tokenizer_worker_num:
+            if time.perf_counter() > deadline:
+                raise TimeoutError(
+                    f"Only {len(worker_pids)}/{self.tokenizer_worker_num} "
+                    "tokenizer workers became ready within 900s"
+                )
+            futures = [
+                loop.run_in_executor(self._executor, _tokenizer_worker_ping)
+                for _ in range(self.tokenizer_worker_num)
+            ]
+            worker_pids.update(await asyncio.gather(*futures))
+            if len(worker_pids) < self.tokenizer_worker_num:
+                logger.info(
+                    "Waiting for tokenizer workers: %d/%d ready after %.0fs",
+                    len(worker_pids),
+                    self.tokenizer_worker_num,
+                    time.perf_counter() - started_at,
+                )
+                await asyncio.sleep(1.0)
         if self.metrics is not None:
             self.metrics.set_worker_count(self.tokenizer_worker_num)
         logger.info(
-            "Initialized KV-cache tokenizer pool with %d process(es); startup "
-            "checks ran on PIDs %s",
+            "Initialized KV-cache tokenizer pool with %d process(es) in %.0fs; "
+            "startup checks ran on PIDs %s",
             self.tokenizer_worker_num,
+            time.perf_counter() - started_at,
             sorted(worker_pids),
         )
+
+    def _run_simulation_and_record(
+        self,
+        page_keys: tuple[bytes, ...],
+        token_count: int,
+        *,
+        is_streaming: bool,
+        tokenize_seconds: float,
+        tokenizer_roundtrip_seconds: float,
+        request_started_at: float,
+    ) -> tuple[dict[str, Any], int]:
+        """Update the stateful simulator and record metrics.
+
+        The tokenizer worker has already rendered, encoded, and built the
+        chained page hashes. Only the shared LRU-history update must be
+        serialized, so this runs on a dedicated single-worker thread and
+        calls the simulator's public process_page_keys entry point with the
+        prebuilt page keys, keeping the CPU-bound work off the asyncio event
+        loop.
+        """
+        with self._simulator_lock:
+            # Results intentionally enter the LRU trace in tokenizer
+            # completion order. The single simulator thread preserves one
+            # global, deterministic trace.
+            self._tokenize_worker_seconds += tokenize_seconds
+            simulation_started_at = time.perf_counter()
+            # Update the shared LRU history from the prebuilt page keys.
+            # Page hashing was already done in the parallel tokenizer
+            # process, so only the serialized history update runs here.
+            analysis = self.simulator.process_page_keys(page_keys)
+            simulation_seconds = time.perf_counter() - simulation_started_at
+            request_number = self.simulator.request_count
+            self._record_analysis(analysis, prompt_tokens=token_count)
+            slide_window = self._required_capacity_slide_window.snapshot()
+            if self.metrics is not None:
+                self.metrics.record_success(
+                    is_streaming=is_streaming,
+                    prompt_tokens=token_count,
+                    tokenize_seconds=tokenize_seconds,
+                    tokenizer_queue_seconds=max(
+                        0, tokenizer_roundtrip_seconds - tokenize_seconds
+                    ),
+                    simulation_seconds=simulation_seconds,
+                    request_seconds=time.perf_counter() - request_started_at,
+                    analysis=analysis,
+                    capacities=self.capacities,
+                    cumulative_page_accesses=self._page_accesses_total,
+                    cumulative_page_hits=self._capacity_page_hits,
+                    cumulative_prefix_hits=self._capacity_prefix_hits,
+                    slide_window=slide_window,
+                )
+            payload = self._analysis_payload(
+                analysis,
+                request_number=request_number,
+                prompt_tokens=token_count,
+                tokenize_seconds=tokenize_seconds,
+            )
+            return payload, token_count
 
     async def analyze(
         self, request: ChatCompletionRequest
@@ -688,7 +813,7 @@ class KvCapacityEstimatorService:
         try:
             loop = asyncio.get_running_loop()
             tokenizer_submitted_at = time.perf_counter()
-            token_ids, tokenize_seconds = await loop.run_in_executor(
+            page_keys, token_count, tokenize_seconds = await loop.run_in_executor(
                 self._executor,
                 _tokenize_chat_request,
                 request.model_dump(mode="json"),
@@ -696,43 +821,18 @@ class KvCapacityEstimatorService:
             tokenizer_roundtrip_seconds = (
                 time.perf_counter() - tokenizer_submitted_at
             )
-            async with self._condition:
-                # Results intentionally enter the LRU trace in tokenizer
-                # completion order. This keeps one global simulator while
-                # allowing independent tokenizer processes to run concurrently.
-                self._tokenize_worker_seconds += tokenize_seconds
-                simulation_started_at = time.perf_counter()
-                analysis = self.simulator.process(
-                    self.TokenIdsRequest(input_ids=tuple(token_ids))
-                )
-                simulation_seconds = time.perf_counter() - simulation_started_at
-                request_number = self.simulator.request_count
-                self._record_analysis(analysis, prompt_tokens=len(token_ids))
-                slide_window = self._required_capacity_slide_window.snapshot()
-                if self.metrics is not None:
-                    self.metrics.record_success(
-                        is_streaming=request.stream,
-                        prompt_tokens=len(token_ids),
-                        tokenize_seconds=tokenize_seconds,
-                        tokenizer_queue_seconds=max(
-                            0, tokenizer_roundtrip_seconds - tokenize_seconds
-                        ),
-                        simulation_seconds=simulation_seconds,
-                        request_seconds=time.perf_counter() - request_started_at,
-                        analysis=analysis,
-                        capacities=self.capacities,
-                        cumulative_page_accesses=self._page_accesses_total,
-                        cumulative_page_hits=self._capacity_page_hits,
-                        cumulative_prefix_hits=self._capacity_prefix_hits,
-                        slide_window=slide_window,
-                    )
-                payload = self._analysis_payload(
-                    analysis,
-                    request_number=request_number,
-                    prompt_tokens=len(token_ids),
+            return await loop.run_in_executor(
+                self._simulator_executor,
+                functools.partial(
+                    self._run_simulation_and_record,
+                    page_keys,
+                    token_count,
+                    is_streaming=request.stream,
                     tokenize_seconds=tokenize_seconds,
-                )
-                return payload, len(token_ids)
+                    tokenizer_roundtrip_seconds=tokenizer_roundtrip_seconds,
+                    request_started_at=request_started_at,
+                ),
+            )
         except BaseException:
             async with self._condition:
                 self._failed_requests += 1
@@ -755,6 +855,26 @@ class KvCapacityEstimatorService:
         await asyncio.to_thread(
             self._executor.shutdown, wait=True, cancel_futures=True
         )
+        # Drain after the tokenizer pool so no simulation work can be
+        # submitted concurrently.
+        await asyncio.to_thread(self._simulator_executor.shutdown, wait=True)
+
+    def _do_finalize(self) -> dict[str, Any]:
+        """Finalize the simulator state. Runs on the dedicated simulator thread
+        so ``finish()`` happens strictly after every in-flight ``process()``."""
+        with self._simulator_lock:
+            if self._final_result is None:
+                result = self.simulator.finish()
+                self._final_result = dataclasses.asdict(result)
+                self._final_result.update(
+                    {
+                        "tokenizer_workers": self.tokenizer_worker_num,
+                        "tokenize_worker_seconds": self._tokenize_worker_seconds,
+                        "online_metrics": self._online_metrics_payload(),
+                    }
+                )
+                self._write_output(self._final_result)
+            return self._final_result
 
     def _analysis_payload(
         self,
@@ -881,18 +1001,8 @@ class KvCapacityEstimatorService:
             self._accepting_requests = False
             while self._pending_requests:
                 await self._condition.wait()
-            if self._final_result is None:
-                result = self.simulator.finish()
-                self._final_result = dataclasses.asdict(result)
-                self._final_result.update(
-                    {
-                        "tokenizer_workers": self.tokenizer_worker_num,
-                        "tokenize_worker_seconds": self._tokenize_worker_seconds,
-                        "online_metrics": self._online_metrics_payload(),
-                    }
-                )
-                self._write_output(self._final_result)
-            return self._final_result
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._simulator_executor, self._do_finalize)
 
     def _write_output(self, result: dict[str, Any]) -> None:
         if self.output_path is None:
