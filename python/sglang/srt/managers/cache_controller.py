@@ -42,7 +42,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import (
     L2Transfer,
     L2TransferEngine,
-    make_timing_event_pair,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import (
@@ -588,7 +587,7 @@ class HiCacheController:
                 f"{storage_backend!r} while MLA/NSA host-memory dedup is "
                 f"active: non-rank-0 attn-TP ranks hold dummy host pools "
                 f"(kv_buffer=None) and this backend would dereference them. "
-                f"Only None/''/'file' backends can attach later in dedup "
+                f"Only None/''/'file'/'mooncake' backends can attach later in dedup "
                 f"mode. Restart the server with "
                 f"--hicache-storage-backend={storage_backend} to use this "
                 f"backend (every rank will then keep a full host pool)."
@@ -1117,117 +1116,83 @@ class HiCacheController:
         return producer_id
 
     def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
-        """Layerwise H2D on the dedup source followed by layerwise broadcast."""
+        """Load real rank-local pools, then broadcast deduplicated layers."""
         assert self.mla_dedup is not None
         broadcaster = self.mla_dedup.broadcaster
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
         load_stream = self.l2_transfer_engine.host_to_device_stream
         if self.load_fence_stream is not None:
             load_stream.wait_stream(self.load_fence_stream)
 
-        with device_module.stream(load_stream):
-            producer_event.start_event.wait(load_stream)
-            ack_start_event.record()
-            broadcast_plan = broadcaster.prepare_broadcast(
-                op.device_indices, load_stream
-            )
+        transfers = self._prepare_rank_local_load(op)
+        packed_mtp_draft_pools = self._packed_mtp_draft_pools()
+        broadcast_plan = None
 
-            source_state = None
-            if broadcaster.is_src:
-                source_state = self._prepare_mla_source_load(op)
-            draft_state = self._prepare_draft_load(op)
+        def on_layer_done(layer_id: int) -> None:
+            nonlocal broadcast_plan
+            # The engine invokes this callback on the load stream after
+            # waiting for the producer and loading all rank-local pools.
+            if broadcast_plan is None:
+                broadcast_plan = broadcaster.prepare_broadcast(
+                    op.device_indices, load_stream
+                )
 
-            for i in range(self.transfer_layer_id_max):
-                if source_state is not None:
-                    self._load_mla_source_layer(source_state, i)
+            broadcast_layer_id = self._mla_broadcast_layer_id(layer_id)
+            if broadcast_layer_id is not None:
+                broadcaster.broadcast_loaded_layer(broadcast_layer_id, broadcast_plan)
+            if layer_id < len(packed_mtp_draft_pools):
+                broadcaster.broadcast_loaded_mtp_draft(
+                    packed_mtp_draft_pools[layer_id], broadcast_plan
+                )
 
-                # Release each layer after its load-stream work is enqueued.
-                broadcaster.broadcast_loaded_layer(i, broadcast_plan)
-                if draft_state is not None:
-                    self._load_draft_layer(draft_state, i)
+            # Consumers may proceed only after both H2D and broadcast.
+            producer_event.complete(layer_id)
 
-                producer_event.complete(i)
-
-            if source_state is not None:
-                self._record_mla_source_load(source_state)
-            self._record_draft_load(draft_state)
-            ack_finish_event.record()
+        completion = self.l2_transfer_engine.submit_host_to_device(
+            transfers,
+            transfer_layer_id_max=self.transfer_layer_id_max,
+            start_event=producer_event.start_event,
+            on_layer_done=on_layer_done,
+        )
 
         # Avoid overlapping dedup and model-TP communicators across ranks.
         load_stream.synchronize()
 
         self.ack_load_queue.append(
             HiCacheAck(
-                start_event=ack_start_event,
-                finish_event=ack_finish_event,
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
-                timing_enabled=timing_enabled,
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._mla_transfer_num_bytes(op),
             )
         )
         return producer_id
 
-    def _prepare_mla_source_load(self, op: CacheOperation) -> list[L2Transfer]:
+    def _prepare_rank_local_load(self, op: CacheOperation) -> list[L2Transfer]:
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
-        return self.l2_transfer_engine._prepare_transfers(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers)
+        l2_transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
         )
+        return self._rank_local_l2_transfers(l2_transfers)
 
-    def _load_mla_source_layer(
-        self, source_state: list[L2Transfer], layer_id: int
-    ) -> None:
-        self._load_mla_transfers_layer(source_state, layer_id)
+    @staticmethod
+    def _rank_local_l2_transfers(transfers: list[L2Transfer]) -> list[L2Transfer]:
+        return [
+            transfer
+            for transfer in transfers
+            if not getattr(transfer.host_pool, "_is_dummy", False)
+        ]
 
-    def _record_mla_source_load(self, source_state: list[L2Transfer]) -> None:
-        self.l2_transfer_engine._record_stream(
-            source_state, self.l2_transfer_engine.host_to_device_stream
-        )
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        return transfer_layer_id
 
-    def _prepare_draft_load(self, op: CacheOperation) -> Optional[list[L2Transfer]]:
-        return None
-
-    def _load_draft_layer(
-        self,
-        draft_state: Optional[list[L2Transfer]],
-        layer_id: int,
-    ) -> None:
-        if draft_state is not None:
-            self._load_mla_transfers_layer(draft_state, layer_id)
-
-    def _record_draft_load(self, draft_state: Optional[list[L2Transfer]]) -> None:
-        if draft_state is None:
-            return
-        self.l2_transfer_engine._record_stream(
-            draft_state, self.l2_transfer_engine.host_to_device_stream
-        )
-
-    def _load_mla_transfers_layer(
-        self, transfers: list[L2Transfer], layer_id: int
-    ) -> None:
-        primary = transfers[0] if transfers else None
-        for transfer in transfers:
-            local_layer_id = (
-                transfer.layer_mapper(layer_id)
-                if transfer.layer_mapper is not None
-                else layer_id
-            )
-            if local_layer_id is None or (
-                transfer is not primary
-                and transfer.layer_mapper is None
-                and layer_id >= transfer.host_pool.layer_num
-            ):
-                continue
-            transfer.host_pool.load_to_device_per_layer_physical(
-                transfer.device_pool,
-                transfer.host_indices,
-                transfer.device_indices,
-                local_layer_id,
-                self.io_backend,
-                is_draft=transfer.is_draft,
-            )
+    def _packed_mtp_draft_pools(self) -> tuple[object, ...]:
+        return ()
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
@@ -1313,31 +1278,30 @@ class HiCacheController:
             count += 1
         return count
 
-    def _page_transfer(self, operation: PrefetchOperation) -> int:
-        # Dummy ranks contribute an optimistic value to the MIN reduction;
-        # only the source rank performs storage-to-host copies.
-        if self._mla_skip_host_io:
-            completed_pages = 0
-            for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-                batch_pages = min(STORAGE_BATCH_SIZE, len(operation.hash_value) - i)
-                if not operation.is_terminated():
-                    completed_pages += batch_pages
-                self.prefetch_sync_queue.put(
-                    PrefetchAck(
-                        rid=operation.request_id,
-                        completed_tokens=completed_pages * self.page_size,
-                        operation=operation,
-                    )
-                )
-            return completed_pages
+    def _rank_local_pool_transfers(
+        self, pool_transfers: Optional[list[PoolTransfer]]
+    ) -> list[PoolTransfer]:
+        if not self.mla_dedup_enabled:
+            return list(pool_transfers or [])
+        return [
+            transfer
+            for transfer in pool_transfers or []
+            if (
+                (entry := self.mem_pool_host.entry_map.get(transfer.name)) is not None
+                and not getattr(entry.host_pool, "_is_dummy", False)
+            )
+        ]
 
+    def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        kv_derived_transfers = [
-            transfer
-            for transfer in getattr(operation, "pool_transfers", None) or []
-            if transfer.indices_from_pool == PoolName.KV
-        ]
+        kv_derived_transfers = self._rank_local_pool_transfers(
+            [
+                transfer
+                for transfer in getattr(operation, "pool_transfers", None) or []
+                if transfer.indices_from_pool == PoolName.KV
+            ]
+        )
         all_success = True
         completed_pages = 0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1392,8 +1356,12 @@ class HiCacheController:
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
         # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
+        kv_hits = (
+            len(batch_hashes)
+            if self._mla_skip_host_io
+            else self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
         )
 
         # Read from KV-derived sidecar pools, if any.
