@@ -1,20 +1,25 @@
-"""Focused coverage for the opt-in MLA HiCache dedup integration."""
+"""Unit tests for the MLA host-dedup controller integration."""
 
 import unittest
-from contextlib import contextmanager, nullcontext
-from queue import Queue
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 import sglang.srt.managers.cache_controller as cache_controller_module
+import sglang.srt.mem_cache.l2_transfer as l2_transfer_module
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.l2_transfer import L2Transfer
+from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupBroadcaster
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.speculative import base_spec_worker
 from sglang.srt.speculative.base_spec_worker import (
@@ -22,6 +27,7 @@ from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -55,13 +61,24 @@ def _nextn_worker():
     return worker, target_runner, draft_pool
 
 
-class TestHiCacheMLADedupIntegration(unittest.TestCase):
+class TestHiCacheMLADedupIntegration(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # Fake device events must not populate the process-wide capability cache.
+        self.enterContext(
+            mock.patch.object(
+                l2_transfer_module, "_timing_events_supported", return_value=False
+            )
+        )
+
     def test_disabled_flag_keeps_original_write_path(self):
         op = CacheOperation(torch.arange(2), torch.arange(2), node_id=1)
         completion = SimpleNamespace(
             start_event=object(), finish_event=object(), timing_enabled=False
         )
         controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_device_allocator = mock.Mock()
+        controller.load_fence_stream = None
         controller.mla_dedup = None
         controller.write_queue = [op]
         controller.ack_write_queue = []
@@ -74,9 +91,6 @@ class TestHiCacheMLADedupIntegration(unittest.TestCase):
         controller._num_tokens_by_pool = mock.Mock(return_value={})
         controller._transfer_num_bytes = mock.Mock(return_value=0)
         controller._mla_transfer_num_bytes = mock.Mock()
-        controller.mem_pool_device_allocator = SimpleNamespace(
-            set_hicache_transfer_done_event=mock.Mock()
-        )
         controller.l2_transfer_engine = SimpleNamespace(
             submit_device_to_host=mock.Mock(return_value=completion)
         )
@@ -87,6 +101,709 @@ class TestHiCacheMLADedupIntegration(unittest.TestCase):
         controller._l2_transfers.assert_called_once()
         controller._move_mla_write_operation.assert_not_called()
         controller._mla_l2_transfers.assert_not_called()
+        controller._mla_transfer_num_bytes.assert_not_called()
+
+    def test_disabled_flag_keeps_original_load_path(self):
+        op = CacheOperation(torch.arange(2), torch.arange(2), node_id=1)
+        start_event = mock.Mock()
+        producer_event = SimpleNamespace(start_event=start_event, complete=mock.Mock())
+        completion = SimpleNamespace(
+            start_event=object(), finish_event=object(), timing_enabled=False
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_device_allocator = mock.Mock()
+        controller.load_fence_stream = None
+        controller.mla_dedup = None
+        controller.load_queue = [op]
+        controller.ack_load_queue = []
+        controller.transfer_layer_id_max = 2
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=mock.Mock(return_value=0), events=[producer_event]
+        )
+        controller._move_op_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, None)
+        )
+        controller._l2_load_transfers = mock.Mock(return_value=[mock.sentinel.transfer])
+        controller._start_loading_mla = mock.Mock()
+        controller._num_tokens_by_pool = mock.Mock(return_value={})
+        controller._transfer_num_bytes = mock.Mock(return_value=0)
+        controller.load_fence_stream = None
+        controller.l2_transfer_engine = SimpleNamespace(
+            submit_host_to_device=mock.Mock(return_value=completion)
+        )
+
+        self.assertEqual(controller.start_loading(), 0)
+
+        controller._move_op_indices.assert_called_once_with(op)
+        controller._l2_load_transfers.assert_called_once()
+        controller._start_loading_mla.assert_not_called()
+
+    def test_peer_l2_transfer_keeps_only_rank_local_sidecars(self):
+        target_host = SimpleNamespace(_is_dummy=True)
+        draft_host = SimpleNamespace(_is_dummy=False)
+        target_device = object()
+        draft_device = object()
+        anchor = SimpleNamespace(
+            host_pool=target_host,
+            device_pool=target_device,
+            layer_mapper=lambda layer_id: layer_id,
+        )
+        draft_entry = SimpleNamespace(
+            host_pool=draft_host,
+            device_pool=draft_device,
+            layer_mapper=lambda layer_id: layer_id,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_device_allocator = mock.Mock()
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=anchor,
+            entry_map={PoolName.DRAFT: draft_entry},
+        )
+        indices = torch.arange(2)
+
+        transfers = controller._mla_l2_transfers(
+            indices,
+            indices,
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    host_indices=indices,
+                    device_indices=indices,
+                )
+            ],
+        )
+
+        self.assertEqual(len(transfers), 1)
+        self.assertIs(transfers[0].host_pool, draft_host)
+
+    def test_packed_mtp_is_loaded_from_anchor_before_broadcast(self):
+        anchor_host = SimpleNamespace(
+            _is_dummy=False,
+            load_to_device_per_layer_physical=mock.Mock(),
+            prepare_transfer_indices=lambda host, device, backend: (host, device),
+        )
+        target_pool = object()
+        draft_pool = object()
+        anchor = SimpleNamespace(
+            host_pool=anchor_host,
+            device_pool=target_pool,
+            layer_mapper=lambda layer_id: {0: 0, 1: 1, 2: 2}.get(layer_id),
+            packed_draft_device_pools=(draft_pool,),
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_device_allocator = mock.Mock()
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=anchor,
+            entry_map={PoolName.KV: anchor},
+        )
+        controller.transfer_layer_id_max = 2
+        controller.io_backend = "kernel"
+        indices = torch.arange(2)
+
+        transfers = controller._l2_load_transfers(indices, indices)
+        engine = L2TransferEngine.__new__(L2TransferEngine)
+        engine.host_to_device_stream = mock.Mock()
+        engine.io_backend = "kernel"
+        with mock.patch.object(
+            l2_transfer_module,
+            "device_module",
+            SimpleNamespace(stream=lambda stream: nullcontext(), Event=mock.Mock),
+        ):
+            engine.submit_host_to_device(transfers, transfer_layer_id_max=1)
+
+        self.assertEqual(len(transfers), 2)
+        self.assertEqual(
+            anchor_host.load_to_device_per_layer_physical.call_args_list,
+            [
+                mock.call(
+                    target_pool,
+                    indices,
+                    indices,
+                    0,
+                    "kernel",
+                    is_draft=False,
+                ),
+                mock.call(
+                    draft_pool,
+                    indices,
+                    indices,
+                    2,
+                    "kernel",
+                    is_draft=True,
+                ),
+            ],
+        )
+
+    def test_source_load_includes_target_and_rank_local_sidecars(self):
+        target_host = object()
+        draft_host = object()
+        target = L2Transfer(target_host, object(), torch.arange(1), torch.arange(1))
+        draft = L2Transfer(draft_host, object(), torch.arange(1), torch.arange(1))
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.KV: SimpleNamespace(host_pool=target_host),
+                PoolName.DRAFT: SimpleNamespace(host_pool=draft_host),
+            }
+        )
+        controller._l2_load_transfers = mock.Mock(return_value=[target, draft])
+        op = CacheOperation(torch.arange(1), torch.arange(1), node_id=1)
+        controller._move_op_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, None)
+        )
+
+        self.assertEqual(controller._prepare_rank_local_load(op), [target, draft])
+
+    def test_source_load_and_broadcast_are_layerwise(self):
+        operations = []
+
+        class Event:
+            def __init__(self, name):
+                self.name = name
+
+            def record(self):
+                operations.append(("record", self.name))
+
+            def wait(self, stream):
+                operations.append(("wait", self.name))
+
+        class Stream:
+            def synchronize(self):
+                operations.append(("sync", None))
+
+        broadcaster = SimpleNamespace(
+            is_src=True,
+            prepare_broadcast=lambda indices, stream: (indices, None),
+            broadcast_loaded_layer=lambda layer_id, plan: operations.append(
+                ("broadcast", layer_id)
+            ),
+            broadcast_loaded_mtp_draft=lambda pool, plan: operations.append(
+                ("broadcast_mtp", pool)
+            ),
+        )
+        producer_event = SimpleNamespace(
+            start_event=Event("producer"),
+            complete=lambda layer_id: operations.append(("complete", layer_id)),
+        )
+        # Include a linear layer before the two attention layers. Packed MTP
+        # tails must load at their draft depth, independently of that mapping.
+        anchor_host = SimpleNamespace(
+            _is_dummy=False,
+            load_to_device_per_layer_physical=mock.Mock(
+                side_effect=lambda pool, host, device, layer, backend, **kwargs: (
+                    operations.append(("load", pool, layer, kwargs["is_draft"]))
+                )
+            ),
+        )
+        anchor = SimpleNamespace(
+            host_pool=anchor_host,
+            device_pool="target",
+            layer_mapper=lambda layer_id: {1: 0, 2: 1, 3: 2, 4: 3}.get(layer_id),
+            packed_draft_device_pools=("mtp0", "mtp1"),
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_device_allocator = mock.Mock()
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=anchor, entry_map={PoolName.KV: anchor}
+        )
+        controller.mla_dedup = SimpleNamespace(broadcaster=broadcaster)
+        controller.transfer_layer_id_max = 3
+        controller.load_fence_stream = None
+        controller.io_backend = "kernel"
+        controller.layer_done_counter = SimpleNamespace(events=[producer_event])
+        engine = L2TransferEngine.__new__(L2TransferEngine)
+        engine.host_to_device_stream = Stream()
+        engine.io_backend = "kernel"
+        controller.l2_transfer_engine = engine
+        anchor_host.prepare_transfer_indices = lambda host, device, backend: (
+            host,
+            device,
+        )
+        controller.ack_load_queue = []
+        controller._num_tokens_by_pool = mock.Mock(return_value={})
+        controller._mla_transfer_num_bytes = mock.Mock(return_value=0)
+        op = CacheOperation(torch.arange(2), torch.arange(2), node_id=1)
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, None)
+        )
+
+        fake_device_module = SimpleNamespace(
+            stream=lambda stream: nullcontext(),
+        )
+        ack_start, ack_finish = Event("ack_start"), Event("ack_finish")
+        with (
+            mock.patch.object(l2_transfer_module, "device_module", fake_device_module),
+            mock.patch.object(
+                cache_controller_module, "device_module", fake_device_module
+            ),
+            mock.patch.object(
+                l2_transfer_module,
+                "make_timing_event_pair",
+                return_value=(ack_start, ack_finish, True),
+            ),
+        ):
+            controller._start_loading_mla(0, op)
+
+        self.assertEqual(
+            operations,
+            [
+                ("record", "producer"),
+                ("wait", "producer"),
+                ("wait", "producer"),
+                ("record", "ack_start"),
+                ("load", "mtp0", 2, True),
+                ("broadcast_mtp", "mtp0"),
+                ("complete", 0),
+                ("load", "target", 0, False),
+                ("load", "mtp1", 3, True),
+                ("broadcast", 0),
+                ("broadcast_mtp", "mtp1"),
+                ("complete", 1),
+                ("load", "target", 1, False),
+                ("broadcast", 1),
+                ("complete", 2),
+                ("record", "ack_finish"),
+                ("sync", None),
+            ],
+        )
+        ack = controller.ack_load_queue[0]
+        self.assertIs(ack.start_event, ack_start)
+        self.assertIs(ack.finish_event, ack_finish)
+        self.assertTrue(ack.timing_enabled)
+
+    def test_packed_draft_restore_uses_each_pools_physical_indices(self):
+        """A draft chain deeper than the target must restore every pool before
+        the final layer event, even when each pool maps virtual rows differently.
+        """
+        for is_src in (False, True):
+            with self.subTest(is_src=is_src):
+                indices = torch.arange(2)
+                values = torch.arange(8.0).reshape(4, 2, 1)
+
+                def device_pool(offset):
+                    return SimpleNamespace(
+                        layer_num=1,
+                        kv_cache_dim=1,
+                        device="cpu",
+                        kv_buffer=[torch.full((8, 1), -1.0)],
+                        host_transfer_translate=lambda rows: rows + offset,
+                    )
+
+                target = device_pool(4)
+                drafts = tuple(device_pool(offset) for offset in (0, 2, 6))
+
+                def load(pool, host, device, layer, backend, **kwargs):
+                    pool.kv_buffer[0].index_copy_(0, device, values[layer][host])
+
+                host = SimpleNamespace(
+                    _is_dummy=not is_src,
+                    prepare_transfer_indices=lambda host, device, backend: (
+                        host,
+                        device,
+                    ),
+                    load_to_device_per_layer_physical=load,
+                )
+                anchor = SimpleNamespace(
+                    host_pool=host,
+                    device_pool=target,
+                    layer_mapper=lambda layer: layer,
+                    packed_draft_device_pools=drafts,
+                )
+                broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+                broadcaster.is_src = is_src
+                broadcaster.src_global_rank = 0
+                broadcaster.group = object()
+                broadcaster.device_pool = target
+                broadcaster.device = "cpu"
+                broadcaster.kv_staging = torch.empty(2)
+                broadcaster.idx_bufs = None
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.mem_pool_host = SimpleNamespace(
+                    anchor_entry=anchor, entry_map={PoolName.KV: anchor}
+                )
+                controller.mla_dedup = SimpleNamespace(
+                    is_dummy_rank=not is_src, broadcaster=broadcaster
+                )
+                controller.transfer_layer_id_max = 1
+                controller.io_backend = "kernel"
+                controller.load_fence_stream = None
+                controller.ack_load_queue = []
+                controller.mem_pool_device_allocator = mock.Mock()
+                controller._num_tokens_by_pool = mock.Mock(return_value={})
+                controller._mla_transfer_num_bytes = mock.Mock(return_value=0)
+                controller._move_op_indices = mock.Mock(
+                    return_value=(indices, indices, None)
+                )
+                engine = L2TransferEngine.__new__(L2TransferEngine)
+                engine.io_backend = "kernel"
+                engine.host_to_device_stream = mock.Mock()
+                controller.l2_transfer_engine = engine
+                completed = []
+
+                def complete(layer):
+                    for pool, offset, expected in zip(
+                        (target, *drafts), (4, 0, 2, 6), values
+                    ):
+                        torch.testing.assert_close(
+                            pool.kv_buffer[0][indices + offset], expected
+                        )
+                    completed.append(layer)
+
+                controller.layer_done_counter = SimpleNamespace(
+                    events=[SimpleNamespace(start_event=mock.Mock(), complete=complete)]
+                )
+                broadcasts = []
+
+                def broadcast(tensor, **kwargs):
+                    expected = values[len(broadcasts)].flatten()
+                    if is_src:
+                        torch.testing.assert_close(tensor, expected)
+                    else:
+                        tensor.copy_(expected)
+                    broadcasts.append(tensor.clone())
+
+                fake_device = SimpleNamespace(
+                    stream=lambda stream: nullcontext(), Event=mock.Mock
+                )
+                with (
+                    mock.patch.object(
+                        cache_controller_module, "device_module", fake_device
+                    ),
+                    mock.patch.object(l2_transfer_module, "device_module", fake_device),
+                    mock.patch.object(
+                        torch.distributed, "broadcast", side_effect=broadcast
+                    ),
+                ):
+                    controller._start_loading_mla(
+                        0, CacheOperation(indices, indices, node_id=1)
+                    )
+
+                self.assertEqual(len(broadcasts), 4)
+                self.assertEqual(completed, [0])
+                self.assertEqual(len(controller.ack_load_queue), 1)
+
+    def test_peer_load_broadcasts_with_and_without_rank_local_sidecars(self):
+        for has_sidecar in (False, True):
+            with self.subTest(has_sidecar=has_sidecar):
+                operations = []
+                dummy = SimpleNamespace(_is_dummy=True)
+                sidecar = SimpleNamespace(
+                    _is_dummy=False,
+                    prepare_transfer_indices=lambda host, device, backend: (
+                        host,
+                        device,
+                    ),
+                    load_to_device_per_layer_physical=lambda pool, host, device, layer, backend, **kwargs: (
+                        operations.append(("load_sidecar", layer))
+                    ),
+                )
+                controller = HiCacheController.__new__(HiCacheController)
+                controller.mem_pool_device_allocator = mock.Mock()
+                controller.mem_pool_host = dummy
+                controller.mem_pool_device = object()
+                controller.io_backend = "kernel"
+                broadcaster = SimpleNamespace(
+                    prepare_broadcast=mock.Mock(return_value=mock.sentinel.plan),
+                    broadcast_loaded_layer=lambda layer, plan: operations.append(
+                        ("broadcast", layer)
+                    ),
+                )
+                controller.mla_dedup = SimpleNamespace(
+                    is_dummy_rank=True, broadcaster=broadcaster
+                )
+                controller.transfer_layer_id_max = 2
+                controller.load_fence_stream = None
+                controller.layer_done_counter = SimpleNamespace(
+                    events=[
+                        SimpleNamespace(
+                            start_event=mock.Mock(),
+                            complete=lambda layer: operations.append(
+                                ("complete", layer)
+                            ),
+                        )
+                    ]
+                )
+                controller.ack_load_queue = []
+                controller._num_tokens_by_pool = mock.Mock(return_value={})
+                controller._mla_transfer_num_bytes = mock.Mock(return_value=0)
+                indices = torch.arange(2)
+                controller._move_op_indices = mock.Mock(
+                    return_value=(indices, indices, None)
+                )
+                transfers = [L2Transfer(dummy, object(), indices, indices)]
+                if has_sidecar:
+                    transfers.append(L2Transfer(sidecar, object(), indices, indices))
+                controller._l2_load_transfers = mock.Mock(return_value=transfers)
+                engine = L2TransferEngine.__new__(L2TransferEngine)
+                engine.host_to_device_stream = mock.Mock()
+                engine.io_backend = "kernel"
+                controller.l2_transfer_engine = engine
+
+                with (
+                    mock.patch.object(
+                        cache_controller_module,
+                        "device_module",
+                        SimpleNamespace(stream=lambda stream: nullcontext()),
+                    ),
+                    mock.patch.object(
+                        l2_transfer_module,
+                        "device_module",
+                        SimpleNamespace(
+                            stream=lambda stream: nullcontext(), Event=mock.Mock
+                        ),
+                    ),
+                ):
+                    controller._start_loading_mla(
+                        0, CacheOperation(indices, indices, node_id=1)
+                    )
+
+                expected = []
+                for layer in range(2):
+                    if has_sidecar:
+                        expected.append(("load_sidecar", layer))
+                    expected.extend((("broadcast", layer), ("complete", layer)))
+                self.assertEqual(operations, expected)
+                broadcaster.prepare_broadcast.assert_called_once()
+                engine.host_to_device_stream.synchronize.assert_called_once()
+                self.assertEqual(len(controller.ack_load_queue), 1)
+
+    def test_hybrid_broadcast_skips_linear_layers(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=SimpleNamespace(
+                layer_mapper=lambda layer_id: {0: 0, 2: 1}.get(layer_id)
+            )
+        )
+
+        self.assertEqual(controller._mla_broadcast_layer_id(0), 0)
+        self.assertIsNone(controller._mla_broadcast_layer_id(1))
+        self.assertEqual(controller._mla_broadcast_layer_id(2), 1)
+
+    def test_dedup_peer_backs_up_every_real_sidecar(self):
+        real_pool = SimpleNamespace(_is_dummy=False)
+        dummy_pool = SimpleNamespace(_is_dummy=True)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.backup_skip = True
+        controller.mla_dedup = object()
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(host_pool=real_pool),
+                PoolName.DRAFT_INDEXER: SimpleNamespace(host_pool=real_pool),
+                PoolName.INDEXER: SimpleNamespace(host_pool=dummy_pool),
+            }
+        )
+
+        self.assertTrue(controller.should_backup(PoolTransfer(PoolName.MAMBA)))
+        self.assertTrue(controller.should_backup(PoolTransfer(PoolName.DRAFT_INDEXER)))
+        self.assertFalse(controller.should_backup(PoolTransfer(PoolName.INDEXER)))
+
+        controller.mla_dedup = None
+        controller.storage_backend_type = "mooncake"
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        controller.mem_pool_host.entry_map[PoolName.DRAFT] = SimpleNamespace(
+            host_pool=MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        )
+        self.assertTrue(controller.should_backup(PoolTransfer(PoolName.DRAFT)))
+        self.assertFalse(controller.should_backup(PoolTransfer(PoolName.DRAFT_INDEXER)))
+
+    def test_peer_storage_load_skips_dummy_kv_and_loads_real_draft(self):
+        from queue import Queue
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mla_dedup = SimpleNamespace(is_dummy_rank=True)
+        controller.page_size = 2
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.KV: SimpleNamespace(host_pool=SimpleNamespace(_is_dummy=True)),
+                PoolName.INDEXER: SimpleNamespace(
+                    host_pool=SimpleNamespace(_is_dummy=True)
+                ),
+                PoolName.DRAFT: SimpleNamespace(
+                    host_pool=SimpleNamespace(_is_dummy=False)
+                ),
+            }
+        )
+        controller.page_get_func = mock.Mock(
+            side_effect=AssertionError("dummy KV read")
+        )
+        controller.storage_backend = SimpleNamespace(
+            batch_get_v2=mock.Mock(return_value={PoolName.DRAFT: [True, False]})
+        )
+        controller.prefetch_sync_queue = Queue()
+        operation = SimpleNamespace(
+            request_id="peer",
+            hash_value=["page0", "page1"],
+            host_indices=torch.arange(4),
+            prefix_keys=["prefix"],
+            pool_transfers=[
+                PoolTransfer(name, indices_from_pool=PoolName.KV)
+                for name in (PoolName.INDEXER, PoolName.DRAFT)
+            ],
+            is_terminated=lambda: False,
+        )
+
+        self.assertEqual(controller._page_transfer(operation), 1)
+        controller.page_get_func.assert_not_called()
+        transfers = controller.storage_backend.batch_get_v2.call_args.args[0]
+        self.assertEqual([transfer.name for transfer in transfers], [PoolName.DRAFT])
+        self.assertEqual(
+            controller.prefetch_sync_queue.get_nowait().completed_tokens, 2
+        )
+
+    def test_peer_storage_query_checks_real_sidecars(self):
+        for has_sidecar in (False, True):
+            with (
+                self.subTest(has_sidecar=has_sidecar),
+                mock.patch(
+                    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller."
+                    "get_storage_hash_str",
+                    return_value=["page0", "page1"],
+                ),
+            ):
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.mla_dedup = SimpleNamespace(is_dummy_rank=True)
+                controller.page_size = 2
+                controller.mem_pool_host = SimpleNamespace(
+                    entry_map={
+                        PoolName.INDEXER: SimpleNamespace(
+                            host_pool=SimpleNamespace(_is_dummy=True)
+                        ),
+                        PoolName.MAMBA: SimpleNamespace(
+                            host_pool=SimpleNamespace(_is_dummy=False)
+                        ),
+                    }
+                )
+                controller.storage_backend = mock.Mock()
+                controller.storage_backend.batch_exists_v2.return_value = (
+                    PoolTransferResult(
+                        kv_hit_pages=1,
+                        extra_pool_hit_pages={PoolName.MAMBA: 1},
+                        restorable_prefix_pages=[1],
+                    )
+                )
+                transfers = [PoolTransfer(PoolName.INDEXER)]
+                if has_sidecar:
+                    transfers.append(PoolTransfer(PoolName.MAMBA))
+                operation = SimpleNamespace(
+                    token_ids=[0, 1, 2, 3],
+                    last_hash=None,
+                    assume_stored=False,
+                    prefix_keys=None,
+                    pool_transfers=transfers,
+                    pool_storage_result=PoolTransferResult.empty(),
+                )
+
+                hashes, hit_tokens = controller._storage_hit_query(operation)
+
+                expected_pages = 1 if has_sidecar else 2
+                self.assertEqual(len(hashes), expected_pages)
+                self.assertEqual(hit_tokens, expected_pages * controller.page_size)
+                self.assertEqual(
+                    operation.pool_storage_result.kv_hit_pages, expected_pages
+                )
+                self.assertNotIn(PoolName.INDEXER, operation.query_pool_hit_pages)
+                controller.storage_backend.batch_exists.assert_not_called()
+                if has_sidecar:
+                    self.assertEqual(
+                        operation.pool_storage_result.restorable_prefix_pages, [1]
+                    )
+                    self.assertEqual(operation.query_pool_hit_pages[PoolName.MAMBA], 1)
+                    queried = controller.storage_backend.batch_exists_v2.call_args.args[
+                        1
+                    ]
+                    self.assertEqual([t.name for t in queried], [PoolName.MAMBA])
+                else:
+                    controller.storage_backend.batch_exists_v2.assert_not_called()
+
+    def test_dedup_keeps_nextn_draft_packed(self):
+        for enabled in (False, True):
+            with (
+                self.subTest(enable_dedup=enabled),
+                mock.patch.object(
+                    base_spec_worker,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        enable_unified_cache_external_linker=False,
+                        enable_hierarchical_cache=True,
+                        enable_mla_hicache_host_dedup=enabled,
+                    ),
+                ),
+                mock.patch.object(
+                    base_spec_worker,
+                    "get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_decode_retraction_backup=None
+                    ),
+                ),
+            ):
+                worker, target_runner, draft_pool = _nextn_worker()
+                plan = BaseSpecWorker._build_hicache_draft_plan(worker)
+                self.assertEqual(plan.mode, HiCacheDraftMode.PACKED)
+                self.assertEqual(target_runner.mtp_draft_device_pools, (draft_pool,))
+
+    def test_dedup_keeps_non_mtp_speculative_caches_as_sidecars(self):
+        cases = (
+            ("eagle3", True, True, False, "EagleDraft", HiCacheDraftMode.SIDECAR),
+            ("dflash", False, False, False, "DFlashDraft", HiCacheDraftMode.SIDECAR),
+            ("dspark", False, False, True, "GenericDSpark", HiCacheDraftMode.SIDECAR),
+            (
+                "dspark_dsv4",
+                False,
+                False,
+                True,
+                "DeepseekV4ForCausalLMDSpark",
+                HiCacheDraftMode.PACKED,
+            ),
+        )
+        for name, is_eagle, is_eagle3, is_dspark, architecture, expected in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    base_spec_worker,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        enable_unified_cache_external_linker=False,
+                        enable_hierarchical_cache=True,
+                    ),
+                ),
+                mock.patch.object(
+                    base_spec_worker,
+                    "get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_decode_retraction_backup=None
+                    ),
+                ),
+            ):
+                algorithm = SimpleNamespace(
+                    is_eagle=lambda: is_eagle,
+                    is_eagle3=lambda: is_eagle3,
+                    is_dspark=lambda: is_dspark,
+                )
+                target_runner = SimpleNamespace(
+                    mtp_draft_device_pools=(),
+                    req_to_token_pool=SimpleNamespace(mamba_pool=None),
+                    spec_algorithm=algorithm,
+                )
+                draft_pool = object()
+                draft_runner = SimpleNamespace(
+                    token_to_kv_pool=draft_pool,
+                    req_to_token_pool=SimpleNamespace(mamba_pool=None),
+                    model_config=SimpleNamespace(
+                        num_nextn_predict_layers=0,
+                        hf_config=SimpleNamespace(architectures=[architecture]),
+                    ),
+                )
+                worker = SimpleNamespace(
+                    target_worker=SimpleNamespace(model_runner=target_runner),
+                    _draft_model_runners=lambda: (draft_runner,),
+                )
+
+                plan = BaseSpecWorker._build_hicache_draft_plan(worker)
+
+                self.assertEqual(plan.mode, expected)
+                packed = (draft_pool,) if expected == HiCacheDraftMode.PACKED else ()
+                self.assertEqual(target_runner.mtp_draft_device_pools, packed)
 
     def test_write_fences_precede_copy_with_and_without_dedup(self):
         for dedup in (False, True):
@@ -146,212 +863,15 @@ class TestHiCacheMLADedupIntegration(unittest.TestCase):
                     self.assertEqual(controller.write_queue, [])
                     self.assertEqual(len(controller.ack_write_queue), 1)
 
-    def test_disabled_flag_keeps_original_load_path(self):
-        op = CacheOperation(torch.arange(2), torch.arange(2), node_id=1)
-        producer_event = SimpleNamespace(start_event=mock.Mock(), complete=mock.Mock())
-        completion = SimpleNamespace(
-            start_event=object(), finish_event=object(), timing_enabled=False
-        )
-        controller = HiCacheController.__new__(HiCacheController)
-        controller.mla_dedup = None
-        controller.load_queue = [op]
-        controller.ack_load_queue = []
-        controller.transfer_layer_id_max = 2
-        controller.layer_done_counter = SimpleNamespace(
-            update_producer=mock.Mock(return_value=0), events=[producer_event]
-        )
-        controller._move_op_indices = mock.Mock(
-            return_value=(op.host_indices, op.device_indices, None)
-        )
-        controller._l2_load_transfers = mock.Mock(return_value=[mock.sentinel.transfer])
-        controller._start_loading_mla = mock.Mock()
-        controller._num_tokens_by_pool = mock.Mock(return_value={})
-        controller._transfer_num_bytes = mock.Mock(return_value=0)
-        controller.load_fence_stream = None
-        controller.mem_pool_device_allocator = SimpleNamespace(
-            set_hicache_transfer_done_event=mock.Mock()
-        )
-        controller.l2_transfer_engine = SimpleNamespace(
-            submit_host_to_device=mock.Mock(return_value=completion)
-        )
-
-        self.assertEqual(controller.start_loading(), 0)
-        controller._move_op_indices.assert_called_once_with(op)
-        controller._l2_load_transfers.assert_called_once()
-        controller._start_loading_mla.assert_not_called()
-
-    def test_peer_write_keeps_only_rank_local_sidecars(self):
-        target_host = SimpleNamespace(_is_dummy=True)
-        draft_host = SimpleNamespace(_is_dummy=False)
-        anchor = SimpleNamespace(
-            host_pool=target_host,
-            device_pool=object(),
-            layer_mapper=lambda layer_id: layer_id,
-        )
-        draft_entry = SimpleNamespace(
-            host_pool=draft_host,
-            device_pool=object(),
-            layer_mapper=lambda layer_id: layer_id,
-        )
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.mem_pool_host = SimpleNamespace(
-            anchor_entry=anchor,
-            entry_map={PoolName.DRAFT: draft_entry},
-        )
-        indices = torch.arange(2)
-
-        transfers = controller._mla_l2_transfers(
-            indices,
-            indices,
-            [
-                PoolTransfer(
-                    name=PoolName.DRAFT,
-                    host_indices=indices,
-                    device_indices=indices,
-                )
-            ],
-        )
-
-        self.assertEqual(len(transfers), 1)
-        self.assertIs(transfers[0].host_pool, draft_host)
-
-    def test_source_and_rank_local_loads_are_separated(self):
-        target_host, draft_host = object(), object()
-        target = L2Transfer(target_host, object(), torch.arange(1), torch.arange(1))
-        draft = L2Transfer(draft_host, object(), torch.arange(1), torch.arange(1))
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.mem_pool_host = SimpleNamespace(
-            entry_map={
-                PoolName.KV: SimpleNamespace(host_pool=target_host),
-                PoolName.DRAFT: SimpleNamespace(host_pool=draft_host),
-            }
-        )
-        controller._prepare_mla_load_transfers = mock.Mock(return_value=[target, draft])
-        op = CacheOperation(torch.arange(1), torch.arange(1), node_id=1)
-
-        self.assertEqual(controller._prepare_mla_source_load(op), [target])
-        self.assertEqual(controller._prepare_draft_load(op), [draft])
-
-    def test_source_load_and_broadcast_are_layerwise(self):
-        operations = []
-
-        class Event:
-            def record(self):
-                pass
-
-            def wait(self, stream):
-                pass
-
-        class Stream:
-            def synchronize(self):
-                operations.append(("sync", None))
-
-        completion = SimpleNamespace(
-            start_event=object(), finish_event=object(), timing_enabled=False
-        )
-
-        class Engine:
-            host_to_device_stream = Stream()
-
-            @staticmethod
-            def resolve_device_indices(transfer):
-                return transfer.device_indices
-
-            @contextmanager
-            def host_to_device_submission(self, transfers, *, start_event=None):
-                yield transfers, completion
-
-        broadcaster = SimpleNamespace(
-            is_src=True,
-            layer_num=2,
-            prepare_broadcast=lambda indices, stream: (indices, None),
-            broadcast_loaded_layer=lambda layer_id, plan: operations.append(
-                ("broadcast", layer_id)
-            ),
-        )
-        producer_event = SimpleNamespace(
-            start_event=Event(),
-            complete=lambda layer_id: operations.append(("complete", layer_id)),
-        )
-        controller = HiCacheController.__new__(HiCacheController)
-        controller.mla_dedup = SimpleNamespace(broadcaster=broadcaster)
-        controller.transfer_layer_id_max = 2
-        controller.layer_done_counter = SimpleNamespace(events=[producer_event])
-        controller.l2_transfer_engine = Engine()
-        controller.load_fence_stream = None
-        controller.ack_load_queue = []
-        controller.mem_pool_device_allocator = SimpleNamespace(
-            set_hicache_transfer_done_event=mock.Mock()
-        )
-        controller._prepare_mla_source_load = mock.Mock(return_value=["target"])
-        controller._prepare_draft_load = mock.Mock(return_value=["draft"])
-        controller._mla_broadcast_transfer = mock.Mock(
-            return_value=L2Transfer(
-                object(), object(), torch.arange(2), torch.arange(2)
-            )
-        )
-        controller._load_mla_transfers_layer = lambda transfers, layer_id: (
-            operations.append((transfers[0], layer_id))
-        )
-        controller._num_tokens_by_pool = mock.Mock(return_value={})
-        controller._mla_transfer_num_bytes = mock.Mock(return_value=0)
-        op = CacheOperation(torch.arange(2), torch.arange(2), node_id=1)
-
-        with mock.patch.object(
-            cache_controller_module,
-            "device_module",
-            SimpleNamespace(stream=lambda stream: nullcontext()),
-        ):
-            controller._start_loading_mla(0, op)
-
-        self.assertEqual(
-            operations,
-            [
-                ("target", 0),
-                ("broadcast", 0),
-                ("draft", 0),
-                ("complete", 0),
-                ("target", 1),
-                ("broadcast", 1),
-                ("draft", 1),
-                ("complete", 1),
-                ("sync", None),
-            ],
-        )
-
-    def test_dummy_rank_prefetch_does_not_touch_storage(self):
-        controller = HiCacheController.__new__(HiCacheController)
-        controller.mla_dedup = SimpleNamespace(is_dummy_rank=True)
-        controller.page_size = 4
-        controller.prefetch_sync_queue = Queue()
-        operation = SimpleNamespace(
-            hash_value=["a", "b", "c"],
-            request_id="rid",
-            is_terminated=lambda: False,
-        )
-
-        self.assertEqual(controller._page_transfer(operation), 3)
-        self.assertEqual(controller.prefetch_sync_queue.qsize(), 1)
-        ack = controller.prefetch_sync_queue.get_nowait()
-        self.assertEqual(ack.completed_tokens, 12)
-
-    def test_runtime_attach_rejects_non_file_backend(self):
+    def test_runtime_attach_rejects_incompatible_backend(self):
         controller = HiCacheController.__new__(HiCacheController)
         controller.mla_dedup = SimpleNamespace(is_dummy_rank=False)
         controller.enable_storage = False
 
-        with self.assertRaisesRegex(RuntimeError, "while MLA host dedup is active"):
-            controller.attach_storage_backend("mooncake")
-
-    def test_dedup_draft_sidecar_rejects_l3(self):
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.mla_dedup = SimpleNamespace(is_dummy_rank=False)
-
-        with self.assertRaisesRegex(RuntimeError, "rank-local draft pools"):
-            controller.attach_storage_backend(
-                "file",
-                host_pools=[SimpleNamespace(name=PoolName.DRAFT)],
-            )
+        with self.assertRaisesRegex(
+            RuntimeError, "non-dedup-compatible storage backend"
+        ):
+            controller.attach_storage_backend("hf3fs")
 
     def test_shutdown_releases_dedup_communicator(self):
         context = mock.Mock()
@@ -364,36 +884,6 @@ class TestHiCacheMLADedupIntegration(unittest.TestCase):
 
         context.destroy.assert_called_once()
         self.assertIsNone(controller.mla_dedup)
-
-    def test_dedup_keeps_nextn_draft_rank_local(self):
-        for enabled, expected_mode in (
-            (False, HiCacheDraftMode.PACKED),
-            (True, HiCacheDraftMode.SIDECAR),
-        ):
-            with (
-                self.subTest(enable_dedup=enabled),
-                mock.patch.object(
-                    base_spec_worker,
-                    "get_memory",
-                    return_value=SimpleNamespace(
-                        enable_hierarchical_cache=True,
-                        enable_unified_cache_external_linker=False,
-                        enable_mla_hicache_host_dedup=enabled,
-                    ),
-                ),
-                mock.patch.object(
-                    base_spec_worker,
-                    "get_disagg",
-                    return_value=SimpleNamespace(
-                        disaggregation_decode_retraction_backup=None
-                    ),
-                ),
-            ):
-                worker, target_runner, draft_pool = _nextn_worker()
-                plan = BaseSpecWorker._build_hicache_draft_plan(worker)
-                self.assertEqual(plan.mode, expected_mode)
-                expected_packed = () if enabled else (draft_pool,)
-                self.assertEqual(target_runner.mtp_draft_device_pools, expected_packed)
 
 
 if __name__ == "__main__":
