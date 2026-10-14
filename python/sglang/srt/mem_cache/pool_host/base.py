@@ -106,7 +106,9 @@ def host_memory_budget_bytes(
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
-    return free // ranks_per_host()
+    # for L2 dedup, TP rank0 require most of total memory
+    #return free // ranks_per_host()
+    return free
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
