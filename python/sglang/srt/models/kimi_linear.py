@@ -43,6 +43,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import before_mla_forward_layer
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -729,6 +730,7 @@ class KimiLinearModel(nn.Module):
         ):
             aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
         for i in range(self.start_layer, self.end_layer):
+            before_mla_forward_layer(i - self.start_layer)
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
                 hidden_states = self.layers[i](
@@ -762,6 +764,8 @@ class KimiLinearModel(nn.Module):
 
 
 class KimiLinearForCausalLM(nn.Module):
+    supports_mla_forward_load = True
+
     def __init__(
         self,
         config: KimiLinearConfig,

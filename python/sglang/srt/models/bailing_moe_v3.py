@@ -71,6 +71,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import before_mla_forward_layer
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -1348,6 +1349,7 @@ class BailingMoELinearModel(nn.Module):
                     dspark_aux_hidden_states.capture(value, owned=owned)
 
         for i in range(self.start_layer, self.end_layer):
+            before_mla_forward_layer(i - self.start_layer)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states = layer(
@@ -1381,6 +1383,8 @@ class BailingMoELinearModel(nn.Module):
 
 
 class BailingMoeV3ForCausalLM(nn.Module):
+    supports_mla_forward_load = True
+
     def __init__(
         self,
         *,

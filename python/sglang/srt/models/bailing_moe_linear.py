@@ -54,6 +54,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import before_mla_forward_layer
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
@@ -993,6 +994,7 @@ class BailingMoELinearModel(nn.Module):
         )
 
         for i in range(self.start_layer, self.end_layer):
+            before_mla_forward_layer(i - self.start_layer)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states = layer(
@@ -1013,6 +1015,8 @@ class BailingMoELinearModel(nn.Module):
 
 
 class BailingMoELinearForCausalLM(nn.Module):
+    supports_mla_forward_load = True
+
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],

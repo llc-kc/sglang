@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     storage_supports_host_dedup,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,7 @@ class LayerLoadingEvent:
         self.start_event = device_module.Event()  # start event on controller stream
         self.forward_pending = False
         self.generation = 0
+        self.local_copies_event = None
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -117,9 +118,18 @@ class ForwardLayerLoad:
         self.generation = counter.events[consumer_index].generation
 
     def before_layer(self, layer_index: int):
+        self._validate_generation()
+        self.counter.before_layer(layer_index, self.consumer_index)
+
+    def wait_for_local_copies(self):
+        self._validate_generation()
+        event = self.counter.events[self.consumer_index].local_copies_event
+        if event is not None:
+            device_module.current_stream().wait_event(event)
+
+    def _validate_generation(self):
         if self.counter.events[self.consumer_index].generation != self.generation:
             raise RuntimeError("Forward MLA load handle refers to a recycled slot")
-        self.counter.before_layer(layer_index, self.consumer_index)
 
 
 class LayerDoneCounter:
@@ -139,6 +149,7 @@ class LayerDoneCounter:
         )
         self.producer_index = next_index
         self.events[next_index].generation += 1
+        self.events[next_index].local_copies_event = None
         return self.producer_index
 
     def set_consumer(self, index: int):
@@ -156,12 +167,12 @@ class LayerDoneCounter:
             self.on_layer_ready(index, layer_index)
 
     def bind_forward_load(self) -> Optional[ForwardLayerLoad]:
-        if (
-            self.consumer_index >= 0
-            and self.events[self.consumer_index].forward_pending
-        ):
+        if self.has_pending_forward_load(self.consumer_index):
             return ForwardLayerLoad(self, self.consumer_index)
         return None
+
+    def has_pending_forward_load(self, consumer_index: int) -> bool:
+        return consumer_index >= 0 and self.events[consumer_index].forward_pending
 
     def reset(self):
         if any(event.forward_pending for event in self.events):
@@ -634,9 +645,14 @@ class HiCacheController:
             storage_backend
         ):
             raise RuntimeError(
-                "Cannot attach storage backend "
-                f"{storage_backend!r} while MLA host dedup is active; "
-                "peer attention-TP ranks have allocator-only host pools."
+                f"Cannot runtime-attach non-dedup-compatible storage backend "
+                f"{storage_backend!r} while MLA/NSA host-memory dedup is "
+                f"active: non-rank-0 attn-TP ranks hold dummy host pools "
+                f"(kv_buffer=None) and this backend would dereference them. "
+                f"Only None/''/'file'/'mooncake' backends can attach later in dedup "
+                f"mode. Restart the server with "
+                f"--hicache-storage-backend={storage_backend} to use this "
+                f"backend (every rank will then keep a full host pool)."
             )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
@@ -671,8 +687,7 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.storage_host_pool
             )
-            if not getattr(self.storage_host_pool, "_is_dummy", False):
-                self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            self.storage_backend.register_mem_pool_host(self.storage_host_pool)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -1177,15 +1192,8 @@ class HiCacheController:
         return producer_id
 
     def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
-        """Load the source layer, broadcast it, then restore rank-local drafts."""
+        """Load real rank-local pools, then broadcast deduplicated layers."""
         assert self.mla_dedup is not None
-        broadcaster = self.mla_dedup.broadcaster
-        if self.transfer_layer_id_max != broadcaster.layer_num:
-            raise RuntimeError(
-                "MLA host dedup requires the transfer-layer count to match the "
-                "target MLA layer count."
-            )
-
         mode = envs.SGLANG_MLA_DEDUP_LOAD_MODE.get()
         if mode == "forward":
             return self._start_loading_mla_forward(producer_id, op)
@@ -1194,6 +1202,7 @@ class HiCacheController:
 
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+
         load_stream = self.l2_transfer_engine.host_to_device_stream
         if self.load_fence_stream is not None:
             load_stream.wait_stream(self.load_fence_stream)
@@ -1202,29 +1211,16 @@ class HiCacheController:
             # Index preparation and virtual-to-physical translation may read
             # producer-owned device state, so gate them before any such access.
             producer_event.start_event.wait(load_stream)
-            source_transfers = (
-                self._prepare_mla_source_load(op) if broadcaster.is_src else []
-            )
-            draft_transfers = self._prepare_draft_load(op) or []
-            all_transfers = source_transfers + draft_transfers
+            transfers = self._prepare_rank_local_load(op)
 
             with self.l2_transfer_engine.host_to_device_submission(
-                all_transfers, start_event=producer_event.start_event
+                transfers, start_event=producer_event.start_event
             ) as (prepared, completion):
-                broadcast_indices = self.l2_transfer_engine.resolve_device_indices(
-                    self._mla_broadcast_transfer(op)
-                )
-                source_count = len(source_transfers)
-                prepared_source = prepared[:source_count]
-                prepared_draft = prepared[source_count:]
-                broadcast_plan = broadcaster.prepare_broadcast(
-                    broadcast_indices, load_stream
-                )
+                plan, draft_plans = self._prepare_mla_broadcasts(op, load_stream)
 
                 for layer_id in range(self.transfer_layer_id_max):
-                    self._load_mla_transfers_layer(prepared_source, layer_id)
-                    broadcaster.broadcast_loaded_layer(layer_id, broadcast_plan)
-                    self._load_mla_transfers_layer(prepared_draft, layer_id)
+                    self._load_mla_transfers_layer(prepared, layer_id)
+                    self._broadcast_mla_loaded_layer(layer_id, plan, draft_plans)
                     producer_event.complete(layer_id)
 
         # All ranks leave the dedicated communicator before model-TP collectives.
@@ -1247,18 +1243,9 @@ class HiCacheController:
 
     def _start_loading_mla_forward(self, producer_id: int, op: CacheOperation) -> int:
         """Prefetch local H2D; forward submits each layer's broadcast."""
-        from sglang.srt.runtime_context import get_server_args
-
-        args = get_server_args()
-        if (
-            self.enable_storage
-            or args.disaggregation_mode != "null"
-            or args.pp_size != 1
-        ):
-            raise ValueError(
-                "Forward MLA load currently requires non-PD, PP1, L2-only serving"
-            )
-        if args.enable_unified_memory:
+        if get_disagg().disaggregation_mode != "null" or get_parallel().pp_size != 1:
+            raise ValueError("Forward MLA load currently requires non-PD, PP1 serving")
+        if get_memory().enable_unified_memory:
             raise ValueError(
                 "Forward MLA load does not yet support movable device pages"
             )
@@ -1267,7 +1254,6 @@ class HiCacheController:
         if producer_id in self._mla_forward_loads:
             raise RuntimeError("MLA load slot already has unsubmitted broadcasts")
 
-        broadcaster = self.mla_dedup.broadcaster
         producer = self.layer_done_counter.events[producer_id]
         producer.forward_pending = True
         producer.start_event.record()
@@ -1277,21 +1263,15 @@ class HiCacheController:
         copy_ready = [device_module.Event() for _ in range(self.transfer_layer_id_max)]
         with device_module.stream(load_stream):
             producer.start_event.wait(load_stream)
-            source = self._prepare_mla_source_load(op) if broadcaster.is_src else []
-            draft = self._prepare_draft_load(op) or []
+            transfers = self._prepare_rank_local_load(op)
             with self.l2_transfer_engine.host_to_device_submission(
-                source + draft, start_event=producer.start_event
+                transfers, start_event=producer.start_event
             ) as (prepared, completion):
-                indices = self.l2_transfer_engine.resolve_device_indices(
-                    self._mla_broadcast_transfer(op)
-                )
-                plan = broadcaster.prepare_broadcast(indices, load_stream)
-                prepared_source = prepared[: len(source)]
-                prepared_draft = prepared[len(source) :]
+                plan, draft_plans = self._prepare_mla_broadcasts(op, load_stream)
                 for layer in range(self.transfer_layer_id_max):
-                    self._load_mla_transfers_layer(prepared_source, layer)
-                    self._load_mla_transfers_layer(prepared_draft, layer)
+                    self._load_mla_transfers_layer(prepared, layer)
                     copy_ready[layer].record()
+        producer.local_copies_event = copy_ready[-1]
 
         finish = device_module.Event(
             **({"enable_timing": True} if completion.timing_enabled else {})
@@ -1299,6 +1279,7 @@ class HiCacheController:
         self._mla_forward_loads[producer_id] = {
             "op": op,
             "plan": plan,
+            "draft_plans": draft_plans,
             "copy_ready": copy_ready,
             "completion": completion,
             "finish": finish,
@@ -1320,7 +1301,7 @@ class HiCacheController:
         stream = device_module.current_stream()
         for layer in range(state["next_layer"], layer_id + 1):
             stream.wait_event(state["copy_ready"][layer])
-            self.mla_dedup.broadcaster.broadcast_loaded_layer(layer, state["plan"])
+            self._broadcast_mla_loaded_layer(layer, state["plan"], state["draft_plans"])
             self.layer_done_counter.events[producer_id].complete(layer)
             state["next_layer"] = layer + 1
         if state["next_layer"] != self.transfer_layer_id_max:
@@ -1328,9 +1309,10 @@ class HiCacheController:
 
         # H2D completion alone does not make the peer KV ready.
         state["finish"].record()
-        for indices in state["plan"]:
-            if indices is not None and indices.is_cuda:
-                indices.record_stream(stream)
+        for plan in (state["plan"], *(p for _, p in state["draft_plans"])):
+            for indices in plan:
+                if indices is not None and indices.is_cuda:
+                    indices.record_stream(stream)
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), state["finish"]
         )
@@ -1348,6 +1330,31 @@ class HiCacheController:
         )
         del self._mla_forward_loads[producer_id]
 
+    def _prepare_mla_broadcasts(self, op: CacheOperation, stream):
+        broadcaster = self.mla_dedup.broadcaster
+        transfer = self._mla_broadcast_transfer(op)
+
+        def prepare(pool_transfer):
+            indices = self.l2_transfer_engine.resolve_device_indices(pool_transfer)
+            return broadcaster.prepare_broadcast(indices, stream)
+
+        # Each draft has its own virtual-to-physical mapping, including on peers
+        # that hold no host copy of the packed target/draft data.
+        return prepare(transfer), tuple(
+            (pool, prepare(transfer._replace(device_pool=pool)))
+            for pool in self._packed_mtp_draft_pools()
+        )
+
+    def _broadcast_mla_loaded_layer(self, layer_id: int, plan, draft_plans) -> None:
+        broadcaster = self.mla_dedup.broadcaster
+        broadcast_layer_id = self._mla_broadcast_layer_id(layer_id)
+        if broadcast_layer_id is not None:
+            broadcaster.broadcast_loaded_layer(broadcast_layer_id, plan)
+        for depth, (pool, draft_plan) in enumerate(draft_plans):
+            # Match the H2D schedule, including chains deeper than the target.
+            if layer_id == min(depth, self.transfer_layer_id_max - 1):
+                broadcaster.broadcast_loaded_mtp_draft(pool, draft_plan)
+
     def _mla_broadcast_transfer(self, op: CacheOperation) -> L2Transfer:
         return L2Transfer(
             host_pool=self.mem_pool_host,
@@ -1355,13 +1362,6 @@ class HiCacheController:
             host_indices=op.host_indices,
             device_indices=op.device_indices,
         )
-
-    def _prepare_mla_source_load(self, op: CacheOperation) -> list[L2Transfer]:
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
-        return self._l2_load_transfers(host_indices, device_indices, pool_transfers)
-
-    def _prepare_draft_load(self, op: CacheOperation) -> Optional[list[L2Transfer]]:
-        return None
 
     def _load_mla_transfers_layer(
         self, transfers: list[L2Transfer], layer_id: int
@@ -1387,6 +1387,27 @@ class HiCacheController:
                 self.io_backend,
                 is_draft=transfer.is_draft,
             )
+
+    def _prepare_rank_local_load(self, op: CacheOperation) -> list[L2Transfer]:
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        l2_transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
+        )
+        return self._rank_local_l2_transfers(l2_transfers)
+
+    @staticmethod
+    def _rank_local_l2_transfers(transfers: list[L2Transfer]) -> list[L2Transfer]:
+        return [
+            transfer
+            for transfer in transfers
+            if not getattr(transfer.host_pool, "_is_dummy", False)
+        ]
+
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        return transfer_layer_id
+
+    def _packed_mtp_draft_pools(self) -> tuple[object, ...]:
+        return ()
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
@@ -1472,29 +1493,30 @@ class HiCacheController:
             count += 1
         return count
 
-    def _page_transfer(self, operation: PrefetchOperation) -> int:
-        if _controller_skips_mla_host_io(self):
-            completed_pages = 0
-            for start in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-                batch_pages = min(STORAGE_BATCH_SIZE, len(operation.hash_value) - start)
-                if not operation.is_terminated():
-                    completed_pages += batch_pages
-                self.prefetch_sync_queue.put(
-                    PrefetchAck(
-                        rid=operation.request_id,
-                        completed_tokens=completed_pages * self.page_size,
-                        operation=operation,
-                    )
-                )
-            return completed_pages
+    def _rank_local_pool_transfers(
+        self, pool_transfers: Optional[list[PoolTransfer]]
+    ) -> list[PoolTransfer]:
+        if not self.mla_dedup_enabled:
+            return pool_transfers or []
+        return [
+            transfer
+            for transfer in pool_transfers or []
+            if (
+                (entry := self.mem_pool_host.entry_map.get(transfer.name)) is not None
+                and not getattr(entry.host_pool, "_is_dummy", False)
+            )
+        ]
 
+    def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        kv_derived_transfers = [
-            transfer
-            for transfer in getattr(operation, "pool_transfers", None) or []
-            if transfer.indices_from_pool == PoolName.KV
-        ]
+        kv_derived_transfers = self._rank_local_pool_transfers(
+            [
+                transfer
+                for transfer in getattr(operation, "pool_transfers", None) or []
+                if transfer.indices_from_pool == PoolName.KV
+            ]
+        )
         all_success = True
         completed_pages = 0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1556,8 +1578,12 @@ class HiCacheController:
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
         # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
+        kv_hits = (
+            len(batch_hashes)
+            if self._mla_skip_host_io
+            else self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
         )
 
         # Read from KV-derived sidecar pools, if any.

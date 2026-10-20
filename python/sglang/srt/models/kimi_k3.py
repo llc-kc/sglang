@@ -109,6 +109,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import before_mla_forward_layer
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -2873,6 +2874,7 @@ class KimiK3LinearModel(nn.Module):
                     )
                 )
         for i in range(self.start_layer, self.end_layer):
+            before_mla_forward_layer(i - self.start_layer)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states = self.layers[i](
                     positions=positions,
@@ -2969,6 +2971,8 @@ class KimiK3LinearModel(nn.Module):
 
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
+
+    supports_mla_forward_load = True
 
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
@@ -3425,6 +3429,8 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    supports_mla_forward_load = True
 
     supports_cuda_vmm_feature_transport = True
 

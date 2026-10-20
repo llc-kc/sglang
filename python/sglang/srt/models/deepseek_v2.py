@@ -158,7 +158,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    before_mla_forward_layer,
+    get_attn_backend,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -3127,9 +3130,7 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                load_handle = getattr(forward_batch, "mla_forward_load_counter", None)
-                if load_handle is not None:
-                    load_handle.before_layer(i - self.start_layer)
+                before_mla_forward_layer(i - self.start_layer)
                 layer = self.layers[i]
                 hidden_states, topk_indices = layer(
                     positions,

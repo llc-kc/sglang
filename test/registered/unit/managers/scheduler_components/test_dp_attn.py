@@ -103,6 +103,9 @@ class TestDPBalanceStats(CustomTestCase):
         get_idle_batch=None,
         sync_wait_carry=None,
         wait_seconds=None,
+        mla_reload=False,
+        peer_mla_reload=False,
+        tbo_inputs=None,
     ):
         if reqs is None:
             # One-token rows, the shortest a decode row can be.
@@ -117,16 +120,31 @@ class TestDPBalanceStats(CustomTestCase):
             # Spec batches carry no CPU seq_lens at schedule time.
             seq_lens_cpu=None,
             dp_balance_stats=None,
+            hicache_consumer_index=0 if mla_reload else -1,
         )
         gathered_mode = forward_mode or ForwardMode.IDLE
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (True, gathered_mode.value)
         tbo_preparer.compute_output.return_value = (None, gathered_mode)
+        if tbo_inputs is not None:
+
+            def compute_output(info):
+                tbo_inputs.append(info.clone())
+                return None, gathered_mode
+
+            tbo_preparer.compute_output.side_effect = compute_output
+
+        from sglang.srt.managers.cache_controller import LayerDoneCounter
+
+        counter = LayerDoneCounter.__new__(LayerDoneCounter)
+        counter.events = [SimpleNamespace(forward_pending=mla_reload)]
 
         def fake_all_gather_single(output, local, group, **_):
             peer = local.clone()
             peer[0] = peer[1] = peer_tokens  # num_tokens, num_tokens_for_logprob
             peer[9] = int(peer_health_check)
+            peer[2] = peer[6] = peer[8] = int(not peer_mla_reload)
+            peer[4] = int(not peer_mla_reload)
             # attention_pairs; one-token rows unless the test says otherwise.
             peer[10] = (
                 peer_tokens if peer_attention_pairs is None else peer_attention_pairs
@@ -173,6 +191,7 @@ class TestDPBalanceStats(CustomTestCase):
                     prefill_cuda_graph_runner=None,
                     spec_algorithm=SpeculativeAlgorithm.NONE,
                     model_config=object(),
+                    token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter),
                 ),
                 get_idle_batch=get_idle_batch
                 or Mock(side_effect=AssertionError("local batch must not be replaced")),
@@ -182,6 +201,30 @@ class TestDPBalanceStats(CustomTestCase):
                 offload_tags=set(),
                 sync_wait_carry=sync_wait_carry,
             )
+
+    def test_asymmetric_mla_reload_forces_all_graph_votes_and_tbo_eager(self):
+        """An attention-DP peer without a reload must not replay a model graph."""
+        for local, peer in ((True, False), (False, True), (False, False)):
+            with self.subTest(local=local, peer=peer):
+                tbo_inputs = []
+                with patch.object(
+                    dp_attn, "_local_prefill_cuda_graph_vote", return_value=True
+                ):
+                    batch = self._prepare_dp2_batch(
+                        ForwardMode.DECODE,
+                        1,
+                        1,
+                        mla_reload=local,
+                        peer_mla_reload=peer,
+                        tbo_inputs=tbo_inputs,
+                    )
+                expected = not (local or peer)
+                self.assertEqual(batch.can_run_decode_cuda_graph, expected)
+                self.assertEqual(batch.can_run_dp_draft_cuda_graph, expected)
+                self.assertEqual(batch.can_run_dp_prefill_cuda_graph, expected)
+                self.assertEqual(
+                    tbo_inputs[0][:, 0].tolist(), [int(not local), int(not peer)]
+                )
 
     def test_attached_to_batch_after_dp_gather(self):
         result = self._prepare_dp2_batch(

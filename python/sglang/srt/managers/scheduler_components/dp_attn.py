@@ -33,6 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import has_pending_mla_forward_load
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
@@ -540,6 +541,16 @@ def prepare_mlp_sync_batch_raw(
         spec_algorithm=model_runner.spec_algorithm,
         model_config=model_runner.model_config,
     )
+    pending_mla = local_batch is not None and has_pending_mla_forward_load(
+        getattr(model_runner, "token_to_kv_pool", None),
+        getattr(local_batch, "hicache_consumer_index", -1),
+    )
+    if pending_mla:
+        # These votes are MIN-reduced across the model communication group.
+        # A reload in one attention-DP group must force every peer eager.
+        can_run_decode_cuda_graph = False
+        can_run_draft_cuda_graph = False
+        can_run_prefill_cuda_graph = False
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     is_health_check = bool(
@@ -567,6 +578,8 @@ def prepare_mlp_sync_batch_raw(
         device = "cpu"
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
+    if pending_mla:
+        local_can_run_tbo = False
     if use_world_group:
         num_dp_ranks = _resolve_elastic_world_num_dp_ranks(
             num_dp_ranks,

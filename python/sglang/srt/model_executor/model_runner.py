@@ -19,7 +19,7 @@ import contextlib
 import inspect
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Union
 
 import torch
@@ -105,8 +105,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
+    bind_mla_forward_load,
     forward_context,
+    get_forward_context,
     has_forward_context,
+    wait_for_mla_state_copies,
 )
 from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_memory_usage,
@@ -1899,6 +1902,10 @@ class ModelRunner:
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             return
+        wait_for_mla_state_copies(
+            clear_indices=forward_batch.mamba_clear_indices,
+            cow_src_indices=forward_batch.mamba_cow_src_indices,
+        )
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
@@ -1936,30 +1943,19 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        if has_forward_context():
-            ctx_mgr = contextlib.nullcontext()
-        else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
-            load_counter = getattr(
-                self.token_to_kv_pool, "layer_transfer_counter", None
-            )
-            load_handle = (
-                load_counter.bind_forward_load()
-                if load_counter is not None
-                and hasattr(load_counter, "bind_forward_load")
-                else None
-            )
+        load_handle = bind_mla_forward_load(
+            self.token_to_kv_pool,
+            can_run_tbo=forward_batch.can_run_tbo,
+            split_prefill=forward_batch.forward_mode.is_split_prefill(),
+            model=self.model,
+        )
+        ctx = (
+            get_forward_context()
+            if has_forward_context()
+            else ForwardContext(attn_backend=self.attn_backend)
+        )
+        with forward_context(replace(ctx, mla_forward_load=load_handle)):
             pending_mla = load_handle is not None
-            if pending_mla and (
-                forward_batch.can_run_tbo
-                or forward_batch.forward_mode.is_split_prefill()
-                or not getattr(self.model, "supports_mla_forward_load", False)
-            ):
-                raise RuntimeError(
-                    "Forward MLA load requires a supported model without TBO or split prefill"
-                )
-            forward_batch.mla_forward_load_counter = load_handle
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

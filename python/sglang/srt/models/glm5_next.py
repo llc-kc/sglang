@@ -81,6 +81,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import before_mla_forward_layer
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -1177,6 +1178,7 @@ class Glm5NextModel(nn.Module):
         aux_hidden_states = AuxHiddenStateList()
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
+            before_mla_forward_layer(i - self.start_layer)
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
@@ -1232,6 +1234,8 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    supports_mla_forward_load = True
+
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "model.visual": "visual",

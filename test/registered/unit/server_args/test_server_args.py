@@ -2180,7 +2180,7 @@ class TestHiCacheArgs(CustomTestCase):
                     enable_hierarchical_cache=True,
                     hicache_storage_backend=backend,
                 )
-                if backend in (None, "", "file"):
+                if backend in (None, "", "file", "mooncake"):
                     handle_hicache(args)
                 else:
                     with self.assertRaisesRegex(ValueError, "only supports"):
