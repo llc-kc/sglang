@@ -31,7 +31,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _SwaStrategy,
     build_full_draft_pools,
     build_host_pool_group,
+    build_hybrid_mamba_stack,
     build_hybrid_swa_group,
+    build_kv_only_group,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
@@ -114,6 +116,32 @@ class TestSplitHicacheSize(CustomTestCase):
         self.assertEqual(shares, (75.0, 25.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
 
+    def test_kv_only_group_builds_dummy_anchor_on_peer_rank(self):
+        host_pool = SimpleNamespace(
+            layout="page_first",
+            page_size=2,
+            device="cpu",
+            size=8,
+            logical_size=8,
+            can_use_write_back_jit=False,
+        )
+        kv_pool = SimpleNamespace(layer_num=2)
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+            "build_kv_host_pool",
+            return_value=host_pool,
+        ) as build_host_pool:
+            group = build_kv_only_group(
+                page_size=2,
+                kv_pool=kv_pool,
+                full_layer_mapping={0: 0, 1: 1},
+                use_mla=True,
+                is_dummy=True,
+            )
+
+        self.assertIs(group.anchor_entry.host_pool, host_pool)
+        self.assertTrue(build_host_pool.call_args.kwargs["is_dummy"])
+
     def test_splits_total_budget_by_device_bytes_three_pools(self):
         # scalar and (k, v) tuple return shapes both supported
         shares = _split_hicache_size(
@@ -174,6 +202,8 @@ class TestHybridStageLayerMappings(CustomTestCase):
                     params = SimpleNamespace(
                         req_to_token_pool=req_pool,
                         tp_cache_group=None,
+                        attn_cp_cache_group=None,
+                        attn_tp_cache_group=None,
                         pp_cache_group=None,
                     )
                     controller = SimpleNamespace(transfer_layer_id_max=4)
@@ -182,9 +212,18 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         if strategy_cls is _MambaStrategy
                         else (MagicMock(), controller)
                     )
-                    with patch.object(
-                        hybrid_pool_assembler, builder_name, return_value=built
-                    ) as build_stack:
+                    with (
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_memory",
+                            return_value=SimpleNamespace(
+                                enable_mla_hicache_host_dedup=False
+                            ),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler, builder_name, return_value=built
+                        ) as build_stack,
+                    ):
                         result = strategy_cls().build(
                             cache=SimpleNamespace(page_size=1),
                             kvcache=kvcache,
@@ -461,7 +500,12 @@ class TestDeclaredStackStructure(CustomTestCase):
             )
 
         def dummy_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=True,
         ):
             return real_indexer_host(
                 decl,
@@ -469,7 +513,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 packed_draft_device_pools=packed_draft_device_pools,
                 allocator_type=allocator_type,
                 pin_memory=False,
-                is_dummy=True,
+                is_dummy=is_dummy,
             )
 
         with (
@@ -563,6 +607,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                     hicache_write_policy="write_through",
                     hicache_io_backend="kernel",
                     hicache_host_memory_mode="cache",
+                    enable_mla_hicache_host_dedup=False,
                 ),
             ),
         ):
@@ -781,7 +826,12 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             )
 
         def dummy_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=True,
         ):
             return real_indexer_host(
                 decl=decl,
@@ -789,7 +839,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 packed_draft_device_pools=packed_draft_device_pools,
                 allocator_type=allocator_type,
                 pin_memory=False,
-                is_dummy=True,
+                is_dummy=is_dummy,
             )
 
         with (
@@ -814,6 +864,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                     hicache_write_policy="write_through",
                     hicache_io_backend="kernel",
                     hicache_host_memory_mode="cache",
+                    enable_mla_hicache_host_dedup=False,
                 ),
             ),
         ):
@@ -1109,15 +1160,20 @@ def _build_unified_swa_pool(page_size: int = 4):
 
 def _build_unified_host_pair(bundle):
     pool = bundle.token_to_kv_pool
-    return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
-        device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
-        host_to_device_ratio=1.0,
-        host_size=0,
-        page_size=pool.page_size,
-        layout="layer_first",
-        pin_memory=False,
-        allocator_type="default",
-    )
+    # The tiny fixture tests arena geometry independently of the host's RAM.
+    with patch(
+        "sglang.srt.mem_cache.pool_host.unified.host_memory_budget_bytes",
+        return_value=1024**3,
+    ):
+        return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
+            device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
+            host_to_device_ratio=1.0,
+            host_size=0,
+            page_size=pool.page_size,
+            layout="layer_first",
+            pin_memory=False,
+            allocator_type="default",
+        )
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
@@ -1243,6 +1299,105 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
+
+
+class TestHybridMambaDsaAssembly(CustomTestCase):
+    def test_dsa_full_layers_add_dedup_aware_indexer_with_packed_mtp(self):
+        def host_pool(*, is_dummy=False):
+            return SimpleNamespace(
+                _is_dummy=is_dummy,
+                layout="page_first",
+                page_size=2,
+                device="cpu",
+                size=8,
+                logical_size=8,
+                can_use_write_back_jit=False,
+            )
+
+        kv_pool = _dsa_pool_stub(layer_num=2)
+        draft_pool = _dsa_pool_stub(layer_num=1)
+        params = SimpleNamespace(
+            page_size=2,
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(
+                    alloc=MagicMock(),
+                    free=MagicMock(),
+                )
+            ),
+            mtp_draft_device_pools=(draft_pool,),
+            token_to_kv_pool_allocator=MagicMock(),
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        memory = SimpleNamespace(
+            hicache_size=0,
+            hicache_ratio=1,
+            hicache_mem_layout="page_first",
+            hicache_write_policy="write_back",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="kernel",
+        )
+        indexer_host = host_pool(is_dummy=True)
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "build_kv_host_pool",
+                return_value=host_pool(is_dummy=True),
+            ) as build_kv_host,
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.MambaPoolHost",
+                return_value=host_pool(),
+            ),
+            patch.object(
+                pool_host_dsa,
+                "DSAIndexerPoolHost",
+                return_value=indexer_host,
+            ) as build_indexer_host,
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "HybridCacheController",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_memory",
+                return_value=memory,
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "_get_allocator_type",
+                return_value="default",
+            ),
+        ):
+            group, _, config = build_hybrid_mamba_stack(
+                params=params,
+                decls=kv_pool.host_pool_decls(),
+                mamba_pool=SimpleNamespace(),
+                full_layer_mapping={0: 0, 2: 1},
+                mamba_layer_mapping={1: 0},
+                load_cache_event=None,
+                storage_backend="mooncake",
+                use_mla=True,
+                mla_kv_is_dummy=True,
+                mla_dedup_context=MagicMock(),
+            )
+
+        self.assertIn(PoolName.INDEXER, group.entry_map)
+        self.assertTrue(build_kv_host.call_args.kwargs["is_dummy"])
+        self.assertTrue(build_indexer_host.call_args.kwargs["is_dummy"])
+        self.assertEqual(
+            [pool.decl.pool_name for pool in config.pools],
+            [PoolName.KV, PoolName.INDEXER],
+        )
+        self.assertFalse(group.entry_map[PoolName.MAMBA].host_pool._is_dummy)
+        indexer_entry = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(indexer_entry.layer_mapper(0), 0)
+        self.assertIsNone(indexer_entry.layer_mapper(1))
+        self.assertEqual(indexer_entry.layer_mapper(2), 1)
+        self.assertEqual(indexer_entry.layer_mapper(3), 2)
+        self.assertEqual(indexer_entry.packed_draft_device_pools, (draft_pool,))
 
 
 if __name__ == "__main__":
