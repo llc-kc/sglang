@@ -33,7 +33,7 @@ def handle_hicache(server_args: Any):
                 "--enable-mla-hicache-host-dedup cannot be used with "
                 "--enable-unified-cache-external-linker."
             )
-        if cfg.hicache_storage_backend not in (None, "", "file"):
+        if cfg.hicache_storage_backend not in (None, "", "file", "mooncake"):
             raise ValueError(
                 "--enable-mla-hicache-host-dedup only supports no L3 storage "
                 "or --hicache-storage-backend=file."
