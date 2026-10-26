@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
     maybe_create_mla_host_dedup_context,
+    storage_supports_host_dedup,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -30,6 +31,9 @@ class _FakeStream:
 
 
 class TestMLAHostDedupPrimitives(unittest.TestCase):
+    def test_mooncake_supports_dummy_dedup_ranks(self):
+        self.assertTrue(storage_supports_host_dedup("mooncake"))
+
     def test_disabled_flag_is_a_noop(self):
         with mock.patch(
             "sglang.srt.mem_cache.mla_host_dedup.mla_host_dedup_eligible"
