@@ -659,7 +659,44 @@ class UnifiedRadixCache(BasePrefixCache):
             and get_disagg().disaggregation_mode != "decode"
         ):
             result = self.linker.match(params.key, params.req, result)
-        return result
+        return self._apply_branching_ratio(params, result)
+
+    def _apply_branching_ratio(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
+        # Request-dependent policy belongs outside the tree walk so both the
+        # Python and Rust cores use the same checkpoint selection.
+        ratio = envs.SGLANG_HYBRID_CACHE_BRANCHING_RATIO.get()
+        if params.req is None or ratio == 1.0:
+            return result
+        request_length = len(params.req.full_untruncated_fill_ids)
+        length_threshold = envs.SGLANG_HYBRID_CACHE_BRANCHING_LENGTH_THRESHOLD.get()
+        if length_threshold is not None and request_length >= length_threshold:
+            return result
+        boundary = result.device_prefix_len + result.host_hit_length
+        target = int(request_length * ratio)
+        grids = []
+        mamba = self.components.get(ComponentType.MAMBA)
+        if mamba is not None and self.enable_mamba_extra_buffer:
+            # Includes the DCP-widened tree page as well as the kernel chunk.
+            grids.append(("mamba_branching_seqlen", mamba.mamba_checkpoint_grid))
+        swa = self.components.get(ComponentType.SWA)
+        if swa is not None and swa.gates_prefix_match:
+            # Request-local rings do not publish reusable SWA windows in the tree.
+            grids.append(("swa_branching_seqlen", self.page_size))
+        branching = {}
+        for field, grid in grids:
+            # Preserve divergence repair, including when the tree did not return
+            # a target. Compare on the component's grid, as the tree walk does.
+            if (
+                getattr(result, field) is not None
+                or result.full_kv_hit_length // grid * grid > boundary
+            ):
+                continue
+            aligned = target // grid * grid
+            if aligned > boundary:
+                branching[field] = aligned
+        return result._replace(**branching) if branching else result
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()

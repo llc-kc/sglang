@@ -207,6 +207,16 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class EnvFraction(EnvFloat):
+    """A finite float in the interval [0, 1]."""
+
+    def parse(self, value: str) -> float:
+        parsed = super().parse(value)
+        if not 0 <= parsed <= 1:
+            raise ValueError(f'"{value}" is not in the interval [0, 1]')
+        return parsed
+
+
 class GateGemvMode(IntEnum):
     """Small-batch Inkling gate linear implementation.
 
@@ -752,6 +762,13 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # When Full and state hits agree, checkpoint Mamba/SWA at this fraction of
+    # the untruncated request length. 1 keeps the usual chunk-end checkpoints;
+    # existing Full/state divergence repair takes precedence.
+    SGLANG_HYBRID_CACHE_BRANCHING_RATIO = EnvFraction(1.0)
+    # Apply the ratio only to untruncated request lengths strictly below this
+    # token threshold. None applies it to all requests.
+    SGLANG_HYBRID_CACHE_BRANCHING_LENGTH_THRESHOLD = EnvInt(None)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:

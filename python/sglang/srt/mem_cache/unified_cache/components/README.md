@@ -113,6 +113,23 @@ Find the longest cached prefix for a token sequence.
    - Concatenates matched device indices via `torch.cat` (concat length ≤ K, subsumed by O(K))
    - Calls `finalize_match_result_in_tree_core()` per component (tree-side: Full/SWA host-hit sums, Mamba `branching_seqlen`); the cache then routes `finalize_match_result_in_cache()` per component post-walk (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
 
+After match finalization, `SGLANG_HYBRID_CACHE_BRANCHING_RATIO` selects an additional
+Mamba/SWA checkpoint boundary when there is no Full/component divergence to repair.
+For example, `0.8` selects 80% of `req.full_untruncated_fill_ids`, floored to the
+Mamba checkpoint grid (including the DCP tree page) or the SWA tree page. The target
+must be beyond the matched prefix. The default `1.0` keeps chunk-end behavior;
+earlier chunks still use their usual checkpoints until prefill reaches the target.
+This policy runs outside the tree walk for both Python and Rust cores. Interior
+Mamba checkpoints require the extra buffer; request-local SWA rings do not publish
+reusable SWA windows and do not receive a target.
+
+`SGLANG_HYBRID_CACHE_BRANCHING_LENGTH_THRESHOLD` optionally limits this ratio policy
+to requests whose `full_untruncated_fill_ids` token count is strictly below the
+threshold. The default is `None` (unset), which applies the policy to all request
+lengths. For example, setting the ratio to `0.8` and the threshold to `8192` applies
+the 80% checkpoint policy only to requests shorter than 8192 tokens. Requests at or
+above the threshold keep the usual checkpoint behavior, including divergence repair.
+
 ---
 
 ### `insert(params: InsertParams) → InsertResult`
