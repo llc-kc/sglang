@@ -248,6 +248,30 @@ class Serving(msgspec.Struct):
     ] = False
 
     # -------------------------------------------------------------------------
+    # KV capacity estimator
+    # -------------------------------------------------------------------------
+    kv_capacity_estimator: A[
+        bool,
+        "Run the OpenAI chat API as a tokenizer-only KV-cache capacity "
+        "simulator. This mode does not load model weights or start scheduler "
+        "and detokenizer processes.",
+    ] = False
+    kv_capacity_estimator_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "JSON configuration passed to kv-capacity-estimator. "
+                "Only kv_bytes_per_token is required; omitted simulation "
+                "fields use defaults owned by that package. SGLang-only "
+                "fields are output_path, which writes the finalized result, "
+                "and slide_window_size, which defaults to 3000 requests and "
+                "controls the online required-capacity percentile window."
+            ),
+            type_parser=json.loads,
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Streaming
     # -------------------------------------------------------------------------
     stream_interval: A[
