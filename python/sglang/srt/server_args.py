@@ -264,7 +264,7 @@ class ServerArgs:
         try:
             # Validate Torch MPS before model resolution; MLX has its own gate.
             # Platform detection covers the usual omitted --device on macOS.
-            if not use_mlx():
+            if not self.kv_capacity_estimator and not use_mlx():
                 requested_device = getattr(self, "device", None)
                 explicitly_mps = (
                     requested_device is not None
@@ -280,7 +280,8 @@ class ServerArgs:
             # Validate resolved arguments and checkpoint-derived constraints.
             cfg = resolving_view(self)
             if (
-                cfg.device == "mps"
+                not cfg.kv_capacity_estimator
+                and cfg.device == "mps"
                 and not use_mlx()
                 and str(cfg.model_path).lower() not in ("none", "dummy")
             ):

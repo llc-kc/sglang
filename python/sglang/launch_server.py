@@ -29,6 +29,14 @@ def run_server(server_args):
     server_args.resolve_once()
     cfg = resolving_view(server_args)
 
+    if cfg.kv_capacity_estimator:
+        from sglang.srt.entrypoints.kv_capacity_estimator_server import (
+            launch_kv_capacity_estimator_server,
+        )
+
+        launch_kv_capacity_estimator_server(server_args)
+        return
+
     if cfg.encoder_only:
         # For encoder disaggregation
         if cfg.smg_grpc_mode or cfg.grpc_mode:

@@ -39,6 +39,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
+    if cfg.kv_capacity_estimator:
+        from sglang.srt.arg_groups.kv_capacity_estimator_hook import (
+            resolve_kv_capacity_estimator,
+        )
+
+        resolve_kv_capacity_estimator(server_args)
+        return
+
     from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
 
     # Before any handler reads the DP layout.

@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: kv-capacity-estimator
+    orgId: 1
+    folder: SGLang
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 15
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

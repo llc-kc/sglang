@@ -1,0 +1,242 @@
+{
+  "title": "KV capacity estimator",
+  "uid": "kv-capacity-estimator",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "tags": [
+    "sglang",
+    "kv-capacity-estimator"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      },
+      {
+        "name": "job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(sglang:kv_capacity_estimator_requests_total, job)"
+        },
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(sglang:kv_capacity_estimator_requests_total{job=~\"$job\"}, model_name)"
+        },
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false
+      },
+      {
+        "name": "window",
+        "type": "custom",
+        "query": "10s,20s,30s,1m,5m,10m,30m,1h",
+        "current": {
+          "text": "30s",
+          "value": "30s"
+        },
+        "label": "Observation interval"
+      },
+      {
+        "name": "q",
+        "type": "custom",
+        "query": "0.9,0.95,0.99,0.999",
+        "current": {
+          "text": "0.99",
+          "value": "0.99"
+        },
+        "label": "Request coverage"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Prefix token hit rate by capacity",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model_name, capacity, capacity_bytes) (increase(sglang:kv_capacity_estimator_capacity_prefix_hit_tokens_total{model_name=~\"$model\",job=~\"$job\"}[$window])) / on (model_name) group_left sum by (model_name) (increase(sglang:prompt_tokens_total{model_name=~\"$model\",job=~\"$job\",engine_type=\"kv_capacity_estimator\"}[$window]))",
+          "legendFormat": "{{model_name}} / {{capacity}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Prefix-hit tokens / all prompt tokens in the selected observation interval. LRU history is continuous."
+    },
+    {
+      "id": 2,
+      "title": "Recent capacity threshold (reachable requests, interpolated)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile($q, sum by (model_name, le) (increase(sglang:kv_capacity_estimator_required_capacity_bytes_bucket{model_name=~\"$model\",job=~\"$job\"}[$window])))",
+          "legendFormat": "{{model_name}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "title": "Capacity / token hit-rate snapshot",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model_name, capacity, capacity_bytes) (increase(sglang:kv_capacity_estimator_capacity_prefix_hit_tokens_total{model_name=~\"$model\",job=~\"$job\"}[$window])) / on (model_name) group_left sum by (model_name) (increase(sglang:prompt_tokens_total{model_name=~\"$model\",job=~\"$job\",engine_type=\"kv_capacity_estimator\"}[$window]))",
+          "legendFormat": "{{model_name}} / {{capacity}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "title": "Exact request coverage at histogram boundaries",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model_name, le) (increase(sglang:kv_capacity_estimator_required_capacity_bytes_bucket{model_name=~\"$model\",job=~\"$job\"}[$window])) / on (model_name) group_left sum by (model_name) (increase(sglang:kv_capacity_estimator_requests_total{model_name=~\"$model\",job=~\"$job\",status=\"success\"}[$window]))",
+          "legendFormat": "{{model_name}} / {{capacity}}",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Each le boundary is bytes. Compare observed coverage to the desired fraction, then select the smallest sufficient boundary. Includes zero-capacity cold requests."
+    },
+    {
+      "id": 5,
+      "title": "Unreachable request fraction",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model_name) (increase(sglang:kv_capacity_estimator_required_capacity_unreachable_total{model_name=~\"$model\",job=~\"$job\"}[$window])) / on (model_name) sum by (model_name) (increase(sglang:kv_capacity_estimator_requests_total{model_name=~\"$model\",job=~\"$job\",status=\"success\"}[$window]))",
+          "legendFormat": "{{model_name}} / {{capacity}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}

@@ -257,6 +257,29 @@ class Serving(msgspec.Struct):
     ] = False
 
     # -------------------------------------------------------------------------
+    # KV capacity estimator
+    # -------------------------------------------------------------------------
+    kv_capacity_estimator: A[
+        bool,
+        "Run the OpenAI chat API as a tokenizer-only KV-cache capacity "
+        "simulator. This mode does not load model weights or start scheduler "
+        "and detokenizer processes.",
+    ] = False
+    kv_capacity_estimator_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "JSON configuration passed to kv-capacity-estimator. "
+                "Only kv_bytes_per_token is required; omitted simulation "
+                "fields use defaults owned by that package. SGLang-only "
+                "field is output_path, which writes the finalized result. "
+                "Select monitoring time ranges in Prometheus/Grafana."
+            ),
+            type_parser=json.loads,
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Streaming
     # -------------------------------------------------------------------------
     stream_interval: A[
