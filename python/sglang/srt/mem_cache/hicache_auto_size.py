@@ -80,6 +80,14 @@ def _estimate_hicache_bytes(
     """Device bytes whose host mirrors scale with the HiCache ratio."""
     # Every token KV view the pool routes to, and the recurrent state beside it.
     pool = params.token_to_kv_pool_allocator.get_kvcache()
+    if params.decode_swa_from_prefill:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            deepseek_v4_prefix_page_bytes,
+        )
+
+        full_size = getattr(params.token_to_kv_pool_allocator, "size_full", pool.size)
+        pages = (full_size + params.page_size - 1) // params.page_size
+        return pages * deepseek_v4_prefix_page_bytes(pool, params.page_size)
     if not (isinstance(pool, _SIZEABLE_POOLS) or _sub_pool_views(pool)):
         raise ValueError(
             f"HiCache auto-sizing does not support {type(pool).__name__}; "
