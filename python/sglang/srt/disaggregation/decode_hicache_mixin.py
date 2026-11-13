@@ -324,5 +324,9 @@ class DecodeHiCacheTransferMixin:
         req.prefix_len = prefix_match.decode_prefix_len
         req.last_node = restore_lock.node
         req.lock = restore_lock
+        if self.tree_cache.supports_swa():
+            # The receiver owns a fresh window, even when FULL prefix pages
+            # came from L2/L3. Do not pin an older tree window after rematching.
+            self.tree_cache.release_swa(req.lock)
         # Prevent abort cleanup from releasing the transferred lock.
         decode_req.hicache_restore_lock = None

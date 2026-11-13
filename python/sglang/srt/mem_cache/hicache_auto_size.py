@@ -65,6 +65,15 @@ def _estimate_hicache_bytes(
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
     pool = params.token_to_kv_pool_allocator.get_kvcache()
+    if params.decode_swa_from_prefill:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            deepseek_v4_prefix_page_bytes,
+        )
+
+        allocator = params.token_to_kv_pool_allocator
+        full_size = getattr(allocator, "size_full", pool.size)
+        pages = (full_size + params.page_size - 1) // params.page_size
+        return pages * deepseek_v4_prefix_page_bytes(pool, params.page_size)
     if not isinstance(pool, _SIZEABLE_POOLS):
         raise ValueError(
             f"HiCache auto-sizing does not support {type(pool).__name__}; "
