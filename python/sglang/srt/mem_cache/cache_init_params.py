@@ -55,9 +55,12 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
-    # False when tree nodes do not own the SWA state (a per-request SWA ring, or a
-    # paged SWA pool only a draft uses), so it must not gate prefix matching.
+    # False when reuse does not need tree SWA: a per-request ring, a paged pool
+    # only a draft uses, or PD decode receiving a fresh window from prefill.
     swa_gates_prefix_match: bool = True
+    # PD decode restores only prefix pages; prefill supplies the entire window
+    # and compressor state. Keep the SWA component for device slot ownership.
+    decode_swa_from_prefill: bool = False
     decoder_swa_bounded_replay: bool = False
 
     # The prefix tree's slots in drive order; the KV storage supplies them.

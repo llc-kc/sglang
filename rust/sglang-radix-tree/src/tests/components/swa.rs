@@ -590,29 +590,30 @@ fn match_validator_hicache_with_a_host_pool_rejects_swa_tombstones() {
 }
 
 #[test]
-fn match_validator_request_ring_tombstone_acceptance_still_resets_the_window() {
+fn match_validator_request_ring_accepts_a_partial_window_after_a_tombstone() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     tc.set_hicache_enabled();
     let [live, c] = chain(&mut tc);
     tc.arena
         .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
+    tc.arena
+        .set_device_value(c, FULL, Tensor::from_slice(&[1i64]));
     set_swa_device(&mut tc, c);
     let swa = SwaComponent::new(&CacheInitParams {
         swa_req_ring: true,
         ..swa_params_with_window(2)
     });
     let mut validator = swa.create_match_validator(&tc, /* match_device_only = */ true);
-    // The accepted tombstone still zeroes the run: the next valued node
-    // sits below the window.
+    // A request-owned window (including PD's freshly transferred window)
+    // does not require any contiguous SWA coverage from the tree.
     assert!(validator(&tc, live));
-    assert!(!validator(&tc, c));
+    assert!(validator(&tc, c));
 }
 
 #[test]
 fn match_prefix_uses_request_ring_layout_instead_of_hicache_pool_presence() {
     let key: Vec<i64> = (0..12).collect();
     let values: Vec<i64> = (10..22).collect();
-    let prefix = key[..8].to_vec();
     for (swa_req_ring, enable_hicache, has_swa_host_pool) in [
         (false, false, false),
         (true, false, false),
@@ -629,14 +630,31 @@ fn match_prefix_uses_request_ring_layout_instead_of_hicache_pool_presence() {
             },
             vec![FULL, SWA],
         );
-        tc.insert(&insert_params_swa(&key, &values, 0, 8));
-        let result = tc.match_prefix(&match_params(&prefix));
-        assert_eq!(result.full_kv_hit_length, 8);
-        let expected = if swa_req_ring { &values[..8] } else { &[] };
-        assert!(
-            matched_device_indices(&tc, &result).equal(&Tensor::from_slice(expected)),
-            "ring={swa_req_ring}, hicache={enable_hicache}, swa_host={has_swa_host_pool}"
-        );
+        tc.insert(&insert_params_swa(&key, &values, 0, 12));
+        tc.attach_swa_window(
+            &key,
+            Default::default(),
+            4,
+            12,
+            &Tensor::from_slice(&values[4..]),
+        )
+        .unwrap();
+        // End before, inside, and at the end of the retained eight-token SWA
+        // tail. PD can reuse the FULL prefix at every boundary.
+        for prefix_len in [4, 8, 12] {
+            let prefix = key[..prefix_len].to_vec();
+            let result = tc.match_prefix(&match_params(&prefix));
+            assert_eq!(result.full_kv_hit_length, prefix_len);
+            let expected = if swa_req_ring || prefix_len == 12 {
+                &values[..prefix_len]
+            } else {
+                &[]
+            };
+            assert!(
+                matched_device_indices(&tc, &result).equal(&Tensor::from_slice(expected)),
+                "ring={swa_req_ring}, hicache={enable_hicache}, swa_host={has_swa_host_pool}, prefix={prefix_len}"
+            );
+        }
     }
 }
 

@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -543,6 +544,27 @@ def _deepseek_v4_num_host_pages(
     device_full_size = params.token_to_kv_pool_allocator.size_full
     device_full_pages = (device_full_size + page_size - 1) // page_size
 
+    if params.decode_swa_from_prefill:
+        if get_memory().hicache_size > 0:
+            page_bytes = deepseek_v4_prefix_page_bytes(
+                kvcache, page_size, params.mtp_draft_device_pools
+            )
+            if page_bytes == 0:
+                raise ValueError("DeepSeek decode HiCache requires prefix KV pages.")
+            full_host_pages = int(get_memory().hicache_size * 1e9) // page_bytes
+            full_host_pages = sync_fixed_hicache_size(
+                full_host_pages, get_memory().hicache_size
+            )
+            if full_host_pages < 1:
+                raise ValueError(
+                    "--hicache-size must fit at least one DeepSeek KV page."
+                )
+        else:
+            full_host_pages = int(device_full_pages * get_memory().hicache_ratio)
+        # GPU C128 pages share FULL indices. SWA and compressor state arrive
+        # from prefill and need no host capacity, including the draft window.
+        return full_host_pages, 0, full_host_pages
+
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
     if get_memory().hicache_size > 0:
@@ -687,6 +709,33 @@ def _dsv4_low_ratio_entries(
     return entries
 
 
+def deepseek_v4_prefix_page_bytes(
+    kvcache: Any, page_size: int, draft_device_pools: tuple[Any, ...] = ()
+) -> int:
+    """Physical host bytes per FULL page, excluding window/checkpoint state.
+
+    Ratio-1/2 indexer pages need regrouping into FULL-page units, exactly as
+    their host entries do. Extra source pages may pack draft layers too.
+    """
+    infos = _dsv4_pool_infos(kvcache)
+    low_regions = _dsv4_low_ratio_regions(kvcache, infos, page_size)
+    low_names = {name for name, *_ in low_regions}
+    total = sum(
+        sum(buffer[0].nbytes for buffer in buffers) for _, _, buffers, _ in low_regions
+    )
+    total += sum(
+        info.buffer_info.page_bytes * len(info.buffer_info.buffers)
+        for name, info in infos.items()
+        if info.indices_from_pool == PoolName.KV and name not in low_names
+    )
+    for pool in (kvcache, *draft_device_pools):
+        total += sum(
+            region.item_bytes * len(region.device_buffers)
+            for region in pool.extra_host_regions()
+        )
+    return total
+
+
 def _extra_host_region_entries(
     kvcache: Any,
     page_size: int,
@@ -799,6 +848,15 @@ def build_deepseek_v4_hicache_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
     infos = _dsv4_pool_infos(kvcache)
+    if params.decode_swa_from_prefill:
+        # A decode prefix is reusable without a cached window/checkpoint:
+        # every such state is transferred from prefill for this request.
+        # Keep ALL_PAGES sidecars (compressed KV, indexer, RoPE and scales).
+        infos = {
+            name: info
+            for name, info in infos.items()
+            if info.indices_from_pool == PoolName.KV
+        }
     transfer_layer_id_max = len(kvcache.stage_layer_ids)
     full_layer_mapping = _dsv4_transfer_layer_mapping(
         kvcache.stage_layer_ids, kvcache.start_layer
@@ -2136,7 +2194,11 @@ class _DeepSeekV4Strategy(StackStrategy):
             cache_controller=cache_controller,
             component_host_pools=component_host_pools,
             sidecars=sidecars,
-            pools_desc="KV + SWA + DeepSeekV4 sidecars",
+            pools_desc=(
+                "DeepSeekV4 prefix pages (PD supplies window/state)"
+                if params.decode_swa_from_prefill
+                else "KV + SWA + DeepSeekV4 sidecars"
+            ),
         )
 
 
