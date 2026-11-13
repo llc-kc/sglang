@@ -173,6 +173,7 @@ def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
+    decode_swa_from_prefill: bool = False,
 ) -> None:
     if draft_plan.mode == HiCacheDraftMode.FUSED:
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -189,6 +190,12 @@ def maybe_register_hicache_draft(
         )
         return
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
+        return
+    if decode_swa_from_prefill and all(
+        isinstance(pool, DeepSeekV4TokenToKVPool) for pool in draft_plan.device_pools
+    ):
+        # DeepSeek drafts keep their window beside the target's. PD supplies
+        # those rows too; there is no target SWA host pool to attach them to.
         return
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -326,6 +333,12 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _supports_deepseek_decode_hicache(token_to_kv_pool: object) -> bool:
+    # GPU compressed pages share FULL indices; NPU owns an independent C128
+    # component that the prefix-only host stack cannot restore.
+    return isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and not is_npu()
+
+
 def validate_decode_radix_cache(
     *,
     model_config: ModelConfig,
@@ -336,24 +349,29 @@ def validate_decode_radix_cache(
     """Reject decode-side radix cache on KV layouts its prefix reuse cannot serve.
 
     SWA models go through the unified tree, whose component pools preserve the
-    full-attention prefix while the SWA window is transferred fresh. Hybrid
+    full-attention prefix while the SWA window is transferred fresh. DeepSeek
+    GPU HiCache uses the same split, with no window/checkpoint host pools. Hybrid
     SSM/KDA uses UnifiedRadixCache's Mamba component (match + lock + CoW), the
     same path as colocated serving.
     """
     if not is_hybrid_swa:
         return
-    if enable_hierarchical_cache:
+    deepseek_decode_hicache = (
+        enable_hierarchical_cache
+        and _supports_deepseek_decode_hicache(token_to_kv_pool)
+    )
+    if enable_hierarchical_cache and not deepseek_decode_hicache:
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache with sliding "
             "window attention (SWA) models currently supports only "
             "device-resident cache and is incompatible with "
             "--enable-hierarchical-cache."
         )
-    # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
-    # SWA ring and c128 state are request-scoped and always transferred whole, so
-    # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_compressed_kv_arch", False) and not getattr(
-        token_to_kv_pool, "_unified_kv", False
+    # The prefix-only HiCache path also supports paged GPU layouts: prefill
+    # supplies their window and compressor state. Keep the legacy L1-only
+    # path restricted to the unified layout with request-scoped state.
+    if getattr(model_config, "is_compressed_kv_arch", False) and not (
+        deepseek_decode_hicache or getattr(token_to_kv_pool, "_unified_kv", False)
     ):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
@@ -413,11 +431,18 @@ def build_kv_cache(
         sliding_window_size, draft_window_reaches
     )
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
-    # SWA the tree does not own must not gate prefix matching: a per-request ring,
-    # or paged SWA beside the target's encoder-replay request window, which then
-    # only the draft uses.
+    decode_swa_from_prefill = (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_radix_cache
+        and enable_hierarchical_cache
+        and _supports_deepseek_decode_hicache(token_to_kv_pool)
+    )
+    # Reuse must not require tree SWA when PD supplies a fresh window, the target
+    # has a per-request ring, or paged SWA only serves the draft beside the
+    # target's encoder-replay request window.
     swa_gates_prefix_match = not (
-        is_swa_req_ring(token_to_kv_pool_allocator)
+        decode_swa_from_prefill
+        or is_swa_req_ring(token_to_kv_pool_allocator)
         or (
             isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
             and token_to_kv_pool.request_window is not None
@@ -485,6 +510,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         swa_gates_prefix_match=swa_gates_prefix_match,
+        decode_swa_from_prefill=decode_swa_from_prefill,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
         sidecar_draft_device_pools=(
@@ -530,6 +556,7 @@ def build_kv_cache(
             maybe_register_hicache_draft(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,
+                decode_swa_from_prefill=decode_swa_from_prefill,
             )
 
     if retraction_backup == "host_pool":

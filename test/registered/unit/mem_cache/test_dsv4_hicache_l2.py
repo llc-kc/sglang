@@ -1,4 +1,4 @@
-"""Focused CPU contracts for DeepSeek V4 NPU HiCache L2."""
+"""CPU contracts for DeepSeek V4 HiCache pools and PD prefix reuse."""
 
 import unittest
 from types import MethodType, SimpleNamespace
@@ -13,6 +13,8 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache import memory_pool_host
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
@@ -24,14 +26,116 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
 )
 from sglang.srt.mem_cache.pool_host import npu_host_memory
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestDSV4DecodePrefix(CustomTestCase):
+    def test_partial_window_does_not_shorten_decode_prefix(self):
+        """A retained SWA tail must not hide FULL pages when PD supplies SWA.
+
+        Match inside that tail, before it covers a full window. Ordinary SWA
+        matching must still reject the same boundary.
+        """
+        for gates_prefix_match in (False, True):
+            with self.subTest(gates_prefix_match=gates_prefix_match):
+                params = CacheInitParams(
+                    disable=False,
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        has_window_pool=True, device=torch.device("cpu")
+                    ),
+                    page_size=4,
+                    swa_gates_prefix_match=gates_prefix_match,
+                    decode_swa_from_prefill=not gates_prefix_match,
+                    tree_slots=tree_slots_of(
+                        (ComponentType.FULL, ComponentType.SWA), window=8
+                    ),
+                )
+                cache = SimpleNamespace(enable_session_radix_cache=False)
+                core = UnifiedTreeCore(
+                    params,
+                    {
+                        ComponentType.FULL: FullComponent(
+                            cache, params, params.tree_slots[0]
+                        ),
+                        ComponentType.SWA: SWAComponent(
+                            cache, params, params.tree_slots[1]
+                        ),
+                    },
+                )
+                core.set_hicache_enabled()
+                key = RadixKey(list(range(12)))
+                rows = torch.arange(12, dtype=torch.int64)
+                step = core.begin_insert(
+                    InsertParams(
+                        key=key,
+                        value=rows,
+                        component_evicted_seqlens={ComponentType.SWA: 12},
+                    )
+                )
+                self.assertIsNotNone(step.result)
+                self.assertEqual(step.actions, [])
+                core.end_insert()
+                core.attach_swa_window(key, 4, 12, rows[4:], ComponentType.SWA)
+
+                partial = core.match_prefix(MatchPrefixParams(key=key[:8]))
+                self.assertEqual(partial.full_kv_hit_length, 8)
+                self.assertEqual(
+                    partial.device_prefix_len, 0 if gates_prefix_match else 8
+                )
+                complete = core.match_prefix(MatchPrefixParams(key=key))
+                self.assertEqual(complete.device_prefix_len, 12)
+
+    def test_host_prefix_matches_and_loads_without_cached_window(self):
+        """A prefix restored from L3/L2 has no SWA checkpoint: PD supplies it.
+        Requiring one makes valid compressed KV invisible to the decode queue.
+        """
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                has_window_pool=True, device=torch.device("cpu")
+            ),
+            page_size=4,
+            swa_gates_prefix_match=False,
+            decode_swa_from_prefill=True,
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA), window=4),
+        )
+        cache = SimpleNamespace(enable_session_radix_cache=False)
+        components = {
+            ComponentType.FULL: FullComponent(cache, params, params.tree_slots[0]),
+            ComponentType.SWA: SWAComponent(cache, params, params.tree_slots[1]),
+        }
+        core = UnifiedTreeCore(params, components)
+        core.set_hicache_enabled()
+        key = RadixKey(list(range(8)))
+        host_rows = torch.arange(8, dtype=torch.int64)
+        core.insert_host(core.root_node.id, key, host_rows, ["page0", "page1"])
+
+        match = core.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual((match.device_prefix_len, match.host_hit_length), (0, 8))
+        self.assertEqual(max(match.window_host_hit_lengths.values(), default=0), 0)
+        kv_transfer, auxiliary = core.build_load_back_spec(match.best_match_node)
+        self.assertTrue(torch.equal(kv_transfer.host_indices, host_rows))
+        self.assertEqual(auxiliary, {})
+        self.assertEqual(
+            components[ComponentType.SWA]
+            .prepare_prefetch(match.best_match_node, prefetch_tokens=8)
+            .staging_tokens,
+            0,
+        )
 
 
 class TestDSV4DecodeCapacity(CustomTestCase):

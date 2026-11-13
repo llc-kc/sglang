@@ -65,6 +65,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
         )
         params = SimpleNamespace(
             page_size=128,
+            decode_swa_from_prefill=False,
             token_to_kv_pool_allocator=SimpleNamespace(size_full=256),
             mtp_draft_device_pools=[],
             tp_cache_group=None,

@@ -383,17 +383,20 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         match_device_only: bool,
     ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
         let sliding_window_size = self.sliding_window_size;
-        // A per-request SWA ring is not stored in tree nodes. Its layout, not
-        // the presence of a host tier, determines whether tombstones gate reuse.
+        // This also covers PD decode, whose window arrives fresh from prefill:
+        // partial old tree windows must not gate FULL prefix reuse either.
         let swa_req_ring = self.swa_req_ring;
         let mut contiguous_len = usize::MAX;
         Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
             let node = tree_core.arena.node(node_id);
+            if swa_req_ring {
+                return node.backuped() || !node.evicted();
+            }
             // HiCache: a host-only tombstone is a valid match boundary too
             // — load_back will restore SWA from host before use.
             if !node.has_device_value(SWA) && (match_device_only || !node.has_host_value(SWA)) {
                 contiguous_len = 0;
-                return swa_req_ring && (node.backuped() || !node.evicted());
+                return false;
             }
             contiguous_len = contiguous_len.saturating_add(node.key.atom_len());
             contiguous_len >= sliding_window_size

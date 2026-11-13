@@ -2652,6 +2652,13 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            # DeepSeek's KV anchor is logical: only its compressed/indexer
+            # sidecars have storage objects. Probe every KV-derived pool so
+            # decode never promises a prefix with missing physical pages.
+            pool_transfers=self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH, PoolTransfer(name=PoolName.KV), {}
+            )
+            or None,
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)

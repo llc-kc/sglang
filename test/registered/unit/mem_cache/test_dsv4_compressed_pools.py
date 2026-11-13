@@ -605,6 +605,181 @@ class TestV41KVPoolLayouts(CustomTestCase):
                     ),
                 )
 
+    def test_decode_hicache_keeps_all_prefix_pages_with_no_window_host_pool(self):
+        """A PD prefix needs its compressed KV/indexer pages, but no cached
+        window or compressor checkpoint. Fixed host budgets count exactly the
+        retained physical pages, including shared ratio-1/2 sources."""
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.hicache_auto_size import _estimate_hicache_bytes
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        for ratios, sources in (([0, 4, 128], []), ([0, 2, 2, 1, 1], [1, 3])):
+            with self.subTest(ratios=ratios):
+                pool = self.make_pool(
+                    ratios,
+                    sources,
+                    KVLayout.V41,
+                    c4_size=PAGE_SIZE,
+                    c128_size=PAGE_SIZE,
+                    c4_state_pool_size=16,
+                    c128_state_pool_size=16,
+                )
+                # DSPARK draft windows must not require a target SWA host pool.
+                draft = self.make_pool([0, 0], [], KVLayout.V41)
+                params = CacheInitParams(
+                    disable=False,
+                    page_size=PAGE_SIZE,
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        size_full=FULL_SIZE, get_kvcache=lambda: pool
+                    ),
+                    mtp_draft_device_pools=(draft,),
+                    decode_swa_from_prefill=True,
+                    swa_gates_prefix_match=False,
+                )
+                bytes_per_page = assembler.deepseek_v4_prefix_page_bytes(
+                    pool, PAGE_SIZE, (draft,)
+                )
+                self.assertGreater(bytes_per_page, 0)
+                self.assertEqual(
+                    _estimate_hicache_bytes(params, None),
+                    FULL_SIZE // PAGE_SIZE * bytes_per_page,
+                )
+                memory = SimpleNamespace(
+                    hicache_mem_layout="page_first_direct",
+                    hicache_size=3.5 * bytes_per_page / 1e9,
+                    hicache_ratio=2,
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="direct",
+                    hicache_host_memory_mode="cache",
+                )
+                with (
+                    patch.object(assembler, "get_memory", return_value=memory),
+                    patch(
+                        "sglang.srt.mem_cache.memory_pool_host.host_memory_preflight",
+                        side_effect=lambda lengths, **_: (sum(lengths), 1 << 30),
+                    ),
+                    patch.object(
+                        assembler, "_get_allocator_type", return_value="default"
+                    ),
+                    patch.object(
+                        assembler,
+                        "DeepSeekV4PagedHostPool",
+                        partial(DeepSeekV4PagedHostPool, pin_memory=False),
+                    ),
+                    patch.object(assembler, "HybridCacheController"),
+                ):
+                    result = assembler._DeepSeekV4Strategy().build(
+                        cache=SimpleNamespace(
+                            components={
+                                ComponentType.FULL: None,
+                                ComponentType.SWA: None,
+                            }
+                        ),
+                        kvcache=pool,
+                        params=params,
+                        server_args=None,
+                        load_cache_event=None,
+                    )
+                    memory.hicache_size = 0
+                    self.assertEqual(
+                        assembler._deepseek_v4_num_host_pages(
+                            params=params,
+                            kvcache=pool,
+                            page_size=PAGE_SIZE,
+                            swa_page_size=PAGE_SIZE,
+                            c128_attn_allocator=None,
+                        ),
+                        (8, 0, 8),
+                    )
+                entries = result.host_pool_group.entry_map
+                expected = {
+                    info.pool_name
+                    for info in pool.get_device_pool_infos()
+                    if info.indices_from_pool == PoolName.KV
+                }
+                expected.update(
+                    region.pool_name for region in pool.extra_host_regions()
+                )
+                self.assertEqual(set(entries), {PoolName.KV, *expected})
+                self.assertNotIn(PoolName.SWA, entries)
+                self.assertEqual(set(result.component_host_pools), {ComponentType.FULL})
+                self.assertEqual({spec.pool_name for spec in result.sidecars}, expected)
+                self.assertTrue(
+                    all(
+                        spec.indices_from_pool == PoolName.KV
+                        for spec in result.sidecars
+                    )
+                )
+                # Verify the budget against the actual backing tensors, not
+                # just the sizing helper's output.
+                allocated = sum(
+                    entry.host_pool.kv_buffer.nbytes
+                    for name, entry in entries.items()
+                    if name != PoolName.KV
+                )
+                self.assertEqual(allocated, 3 * bytes_per_page)
+                self.assertEqual(entries[PoolName.KV].host_pool.size, 3 * PAGE_SIZE)
+                self._assert_decode_storage_probe(result)
+
+    def _assert_decode_storage_probe(self, stack):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.mem_cache.utils import get_storage_hash_str
+
+        tokens = list(range(2 * PAGE_SIZE))
+        hashes = get_storage_hash_str(tokens, None, page_size=PAGE_SIZE)
+        objects = {
+            f"{page}_test_{spec.pool_name}"
+            for page in hashes
+            for spec in stack.sidecars
+        }
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.mem_pool_host = stack.host_pool_group.anchor_entry.host_pool
+        store.registered_pools = {
+            name: entry.host_pool
+            for name, entry in stack.host_pool_group.entry_map.items()
+        }
+        store.is_mla_backend = True
+        store.mla_suffix = "test"
+        store.config_prefix = None
+        # Only the external binding is replaced: real Mooncake key expansion,
+        # per-pool prefix intersection and controller probing run on CPU.
+        store.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [int(key in objects) for key in keys]
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.storage_backend = store
+        controller.page_size = PAGE_SIZE
+        controller.host_memory_mode = "cache"
+        controller.prefetch_tokens_occupied = 0
+        controller.prefetch_capacity_limit = 2 * PAGE_SIZE
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = controller
+        cache.tree_core = SimpleNamespace(
+            page_size=PAGE_SIZE, is_eagle=False, enable_storage=True
+        )
+        cache.prefetch_threshold = PAGE_SIZE
+        cache.sidecar_pool_specs = stack.sidecars
+        cache.attn_cp_group = cache.attn_tp_group = None
+        cache.tp_world_size = 1
+
+        # No legacy anchor objects or window checkpoints exist in the store.
+        self.assertEqual(store.batch_exists(hashes), 0)
+        self.assertEqual(cache.query_storage_hit_length(0, tokens), 2 * PAGE_SIZE)
+        missing_pool = stack.sidecars[0].pool_name
+        objects.remove(f"{hashes[-1]}_test_{missing_pool}")
+        self.assertEqual(cache.query_storage_hit_length(0, tokens), PAGE_SIZE)
+        objects.remove(f"{hashes[0]}_test_{missing_pool}")
+        self.assertEqual(cache.query_storage_hit_length(0, tokens), 0)
+
     def test_host_swa_appends_all_draft_layers_after_pp_target(self):
         from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
@@ -614,6 +789,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
         draft = self.make_pool([0, 0], [], KVLayout.V41)
         params = SimpleNamespace(
             page_size=PAGE_SIZE,
+            decode_swa_from_prefill=False,
             token_to_kv_pool_allocator=SimpleNamespace(
                 swa_attn_allocator=SimpleNamespace(
                     alloc=lambda n: None, free=lambda indices: None
