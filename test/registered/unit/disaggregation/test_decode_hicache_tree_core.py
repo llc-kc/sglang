@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,6 +20,42 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestDecodeHiCacheTreeCore(CustomTestCase):
+    def test_disabling_l3_prefetch_keeps_pd_prefix_at_l2_boundary(self):
+        tree_cache = SimpleNamespace(
+            enable_storage=True,
+            prefix_device_indices=Mock(return_value=torch.tensor([10, 11])),
+            is_backuped=Mock(return_value=True),
+            get_last_hash_value=Mock(return_value="hash"),
+            hicache_storage_pass_prefix_keys=False,
+            query_storage_hit_length=Mock(return_value=2),
+            prefetch_from_storage=Mock(return_value=True),
+            has_ongoing_prefetch=Mock(return_value=True),
+        )
+        harness = SimpleNamespace(
+            tree_cache=tree_cache,
+            scheduler=SimpleNamespace(enable_decode_hicache=True),
+        )
+        req = SimpleNamespace(
+            cache_request_handle=CacheRequestHandle("req-0", 0),
+            origin_input_ids=[0, 1, 2, 3, 4, 5, 6],
+            extra_key=None,
+            cache_salt=None,
+        )
+        result = SimpleNamespace(
+            host_hit_length=2, last_device_node=11, last_host_node=22
+        )
+
+        with envs.SGLANG_DISABLE_DECODE_HICACHE_L3_PREFETCH.override(True):
+            match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
+                harness, req, result, max_prefix_len=6
+            )
+            DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, match)
+
+        self.assertEqual(match.decode_prefix_len, 4)
+        self.assertEqual(match.restore_token_count, 2)
+        tree_cache.query_storage_hit_length.assert_not_called()
+        tree_cache.prefetch_from_storage.assert_not_called()
+
     def test_stale_prefetch_anchor_degrades_to_l2(self):
         tree_cache = SimpleNamespace(
             hicache_storage_pass_prefix_keys=True,
