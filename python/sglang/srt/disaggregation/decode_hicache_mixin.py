@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
@@ -72,8 +73,8 @@ class DecodeHiCachePreallocMixin:
     ) -> DecodePrefixMatch:
         """Convert a ``match_kv_cache`` result into ``DecodePrefixMatch``.
 
-        Performs the optional L3 storage hit length query when decode-side
-        HiCache is enabled and the last host node is backed up.
+        With L3 prefetch disabled, the prefix advertised to prefill includes
+        only L1 and L2 hits.
         """
         prefix_indices = self.tree_cache.prefix_device_indices(req)
         l1_prefix_len = len(prefix_indices)
@@ -81,7 +82,11 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.enable_decode_hicache and self.tree_cache.enable_storage:
+        if (
+            self.scheduler.enable_decode_hicache
+            and self.tree_cache.enable_storage
+            and not envs.SGLANG_DISABLE_DECODE_HICACHE_L3_PREFETCH.get()
+        ):
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node
